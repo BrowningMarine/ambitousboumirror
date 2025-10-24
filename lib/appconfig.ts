@@ -6,7 +6,7 @@ export const appConfig = {
     cookie_name: 'ambitousboy-session',
     locales: ['en', 'zh', 'vn'] as string[],
     defaultLocale: 'en',
-    odrPrefix: 'ABO',
+    odrPrefix: 'EMO',
     paymentWindowSeconds: 15 * 60, // 30 minutes in seconds
     withdrawExportPw: 'FOux9fCv91mQaBx',
     qrClientUrl: process.env.NEXT_PUBLIC_QR_CLIENT_URL,
