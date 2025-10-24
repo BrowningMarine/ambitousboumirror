@@ -1,0 +1,27 @@
+{  
+  "routes": [  
+    {  
+      "src": "/api/webhook/payment",  
+      "methods": ["POST"],  
+      "headers": {  
+        "Access-Control-Allow-Origin": "*"  
+      }  
+    },  
+    {  
+      "src": "/OneSignalSDKWorker.js",  
+      "headers": {  
+        "Service-Worker-Allowed": "/",  
+        "Cache-Control": "public, max-age=0, must-revalidate",  
+        "Content-Type": "application/javascript; charset=utf-8"  
+      }  
+    },  
+    {  
+      "src": "/OneSignalSDK.sw.js",  
+      "headers": {  
+        "Service-Worker-Allowed": "/",  
+        "Cache-Control": "public, max-age=0, must-revalidate",  
+        "Content-Type": "application/javascript; charset=utf-8"  
+      }  
+    }  
+  ]
+}  
