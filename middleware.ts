@@ -65,6 +65,7 @@ export const publicPaths = [
   '/api',
   '/icons',
   '/payment',
+  '/payment-direct/',
   '/webhook',
   '/public',
   '/transbot'
@@ -237,7 +238,7 @@ export async function middleware(request: NextRequest) {
     }
 
     // Special handling for payment pages - allow frame embedding
-    if (pathname.startsWith('/payment/')) {
+    if (pathname.startsWith('/payment/') || pathname.startsWith('/payment-direct/')) {
       const response = NextResponse.next()
       allowFrameEmbedding(response)
       return addRateLimitHeaders(response, limit, remaining, reset)

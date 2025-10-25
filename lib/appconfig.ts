@@ -50,14 +50,26 @@ export const appConfig = {
         'api.asosvn.online',
     ] as string[],
     // Domain mapping: API domain -> UI domain for payment links
+    // IMPORTANT: This controls where payment URLs point to when creating orders
+    // Key = incoming request domain, Value = payment page domain
     domainMapping: {
+        // Example: api.mydomain.com receives order creation request
+        // Payment URL returned will be: https://admin.mydomain.com/payment/{orderId}
+        // 'api.mydomain.com': 'admin.mydomain.com',
+        
+        // If your domains serve both API and UI on the same domain, map to itself:
+        // 'apiv2.mydomain.com': 'apiv2.mydomain.com',
+        
         'api.thedreamforlife.online': 'admin.thedreamforlife.online',
         'apiv2.thedreamforlife.online': 'apiv2.thedreamforlife.online',
         'apiv3.steamempower.site': 'apiv3.steamempower.site',
         'api.asosvn.online': 'app.asosvn.online',
         'localhost:3000': 'localhost:3000', // For development
-        // Add more mappings as needed
-        // 'api.anotherdomain.com': 'app.anotherdomain.com'
+        
+        // Add your new domains here - example format:
+        // 'api.mydomain.com': 'admin.mydomain.com',     // API -> Admin UI
+        // 'admin.mydomain.com': 'admin.mydomain.com',   // Self-mapping
+        // 'apiv2.mydomain.com': 'apiv2.mydomain.com',   // Self-mapping (client-only mode)
     } as Record<string, string>,
     //others
 } as const;

@@ -11,7 +11,8 @@ import {
 } from "@/lib/utils";
 import type { PaymentData } from "@/lib/payment-encoder";
 import { generateClientQR } from "@/lib/client-qr-generator";
-import { fetchOrderStatus } from "@/lib/supabase-client";
+import { subscribeToOrderChanges, fetchOrderStatus } from "@/lib/supabase-client";
+import { BackupOrder } from "@/lib/supabase-backup";
 
 // Define TypeScript interfaces
 interface ApiResponse {
@@ -66,7 +67,6 @@ function downloadQRCode(qrCodeData: string, orderId: string): void {
         });
     }
   } catch {
-    alert('Lỗi khi tải xuống QR code.');
     alert('Không thể tải xuống QR code. Vui lòng thử lại.');
   }
 }
@@ -120,149 +120,123 @@ export default function ClientOnlyPaymentPage({
   const [isClient, setIsClient] = useState(false);
   const [generatedQR, setGeneratedQR] = useState<string | null>(null);
   const [qrLoading, setQrLoading] = useState(false);
-  const [isLoadingStatus, setIsLoadingStatus] = useState(true); // Loading state for initial status fetch
+  
+  // Track if we've loaded the current status from database (prevents flash on refresh)
+  const [statusLoaded, setStatusLoaded] = useState(false);
 
-  // Use ref for SSE connection to avoid re-renders
-  const eventSourceRef = useRef<EventSource | null>(null);
+  // Use ref for subscription to avoid state updates and re-renders
+  const unsubscribeRef = useRef<(() => void) | null>(null);
 
   // Track if we're on the client side to prevent hydration mismatch
   useEffect(() => {
     setIsClient(true);
   }, []);
 
-  // Fetch current status from Supabase database on mount to ensure we have the latest status
+  // Fetch current order status from database on mount
   useEffect(() => {
     if (!paymentData?.odrId) return;
 
     const orderId = paymentData.odrId;
+    const currentStatus = paymentData.odrStatus;
+    const timestamp = paymentData.timestamp;
     
-    // Fetch current status from Supabase
-    fetchOrderStatus(orderId)
-      .then((dbStatus) => {
-        if (dbStatus) {
-          const currentStatus = dbStatus.odr_status;
-          
-          // Update payment data if status has changed
-          if (currentStatus !== paymentData.odrStatus) {
-            setPaymentData((prevData) => {
-              if (!prevData) return null;
-              return {
-                ...prevData,
-                odrStatus: currentStatus,
-              };
-            });
-
-            // Update effective status based on current database status
-            setEffectiveStatus(getEffectivePaymentStatus(
-              currentStatus,
-              paymentData.timestamp
-            ));
-          }
-        }
-      })
-      .catch(() => {
-        // Failed to fetch status from Supabase - will use default from encoded data
-      })
-      .finally(() => {
-        // Mark status as loaded (stop showing loading state)
-        setIsLoadingStatus(false);
-      });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [paymentData?.odrId]); // Only run once when order ID is available
-
-  // Set up Server-Sent Events (SSE) for real-time status updates
-  useEffect(() => {
-    // Only subscribe if we have payment data and it's in processing/pending status
-    if (
-      !paymentData?.odrId ||
-      (paymentData.odrStatus !== "processing" && paymentData.odrStatus !== "pending")
-    ) {
-      return;
-    }
-
-    const orderId = paymentData.odrId;
-
-    // Don't create duplicate connections
-    if (eventSourceRef.current) {
-      return;
-    }
-
-    // Create SSE connection
-    const eventSource = new EventSource(`/api/payment-sse/${orderId}`);
-    eventSourceRef.current = eventSource;
-
-    // Handle connection opened
-    eventSource.addEventListener('open', () => {
-      // Connection established
-    });
-
-    // Handle incoming messages
-    eventSource.addEventListener('message', (event) => {
-      try {
-        const data = JSON.parse(event.data);
-
-        // Handle different message types
-        if (data.type === 'connected') {
-          // Connected successfully
-        } else if (data.type === 'status_update') {
-          const newStatus = data.status;
-
-          // Update payment data with new status
+    fetchOrderStatus(orderId).then((dbStatus) => {
+      if (dbStatus) {
+        // Update payment data with current status from database
+        if (dbStatus.odr_status !== currentStatus) {
           setPaymentData((prevData) => {
             if (!prevData) return null;
             return {
               ...prevData,
-              odrStatus: newStatus,
+              odrStatus: dbStatus.odr_status,
             };
           });
 
-          // Update effective status
-          if (newStatus === "pending") {
-            setEffectiveStatus("expired");
-          } else {
-            setEffectiveStatus(newStatus);
-          }
-
-          // Set notification based on new status
-          setStatusChanged(true);
-
-          if (newStatus === "completed") {
-            setStatusMessage("Thanh toán đã hoàn thành thành công!");
-          } else if (newStatus === "failed") {
-            setStatusMessage("Thanh toán đã thất bại. Vui lòng thử lại.");
-          } else if (newStatus === "canceled") {
-            setStatusMessage("Thanh toán đã bị hủy.");
-          } else if (newStatus === "pending") {
-            setStatusMessage(
-              "Đơn hàng đã được cập nhật, nhưng đã hết thời gian thanh toán."
-            );
-          }
-
-          // Use custom message if provided
-          if (data.message) {
-            setStatusMessage(data.message);
-          }
+          // Update effective status based on current database status
+          setEffectiveStatus(getEffectivePaymentStatus(
+            dbStatus.odr_status,
+            timestamp
+          ));
         }
-      } catch {
-        // Failed to parse SSE message
       }
-    });
-
-    // Handle errors
-    eventSource.addEventListener('error', () => {
-      // SSE connection error
       
-      // Close and cleanup
-      if (eventSource.readyState === EventSource.CLOSED) {
-        eventSourceRef.current = null;
-      }
+      // Mark status as loaded (prevents showing initial state flash)
+      setStatusLoaded(true);
+    }).catch(() => {
+      // Even on error, mark as loaded so we don't show loading forever
+      setStatusLoaded(true);
     });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paymentData?.odrId]); // Only run once when order ID is available
 
-    // Cleanup on unmount or when status changes to non-processing
+  // Set up Supabase realtime subscription for order status updates
+  useEffect(() => {
+    // Only subscribe if we have payment data and it's in processing/pending status
+    if (
+      paymentData?.odrId &&
+      (paymentData.odrStatus === "processing" || paymentData.odrStatus === "pending") &&
+      !unsubscribeRef.current
+    ) {
+      // Subscribe to Supabase realtime for this order
+      const unsubscribe = subscribeToOrderChanges(
+        paymentData.odrId,
+        (updatedOrder: BackupOrder) => {
+          // Order status changed in Supabase
+          if (updatedOrder.odr_status !== paymentData.odrStatus) {
+            setPaymentData((prevData) => {
+              if (!prevData) return null;
+
+              return {
+                ...prevData,
+                odrStatus: updatedOrder.odr_status,
+              };
+            });
+
+            // Update effective status
+            if (updatedOrder.odr_status === "pending") {
+              setEffectiveStatus("expired");
+            } else {
+              setEffectiveStatus(updatedOrder.odr_status);
+            }
+
+            // Set notification based on new status
+            setStatusChanged(true);
+
+            if (updatedOrder.odr_status === "completed") {
+              setStatusMessage("Thanh toán đã hoàn thành thành công!");
+            } else if (updatedOrder.odr_status === "failed") {
+              setStatusMessage("Thanh toán đã thất bại. Vui lòng thử lại.");
+            } else if (updatedOrder.odr_status === "canceled") {
+              setStatusMessage("Thanh toán đã bị hủy.");
+            } else if (updatedOrder.odr_status === "pending") {
+              setStatusMessage(
+                "Đơn hàng đã được cập nhật, nhưng đã hết thời gian thanh toán."
+              );
+            }
+          }
+        },
+        () => {
+          // Error handler - silently ignore realtime errors
+        }
+      );
+
+      unsubscribeRef.current = unsubscribe;
+    }
+    // If payment is no longer processing/pending but we have an active subscription, unsubscribe
+    else if (
+      paymentData?.odrStatus !== "processing" &&
+      paymentData?.odrStatus !== "pending" &&
+      unsubscribeRef.current
+    ) {
+      unsubscribeRef.current();
+      unsubscribeRef.current = null;
+    }
+
+    // Clean up subscription when component unmounts
     return () => {
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-        eventSourceRef.current = null;
+      if (unsubscribeRef.current) {
+        unsubscribeRef.current();
+        unsubscribeRef.current = null;
       }
     };
   }, [paymentData?.odrId, paymentData?.odrStatus]);
@@ -358,25 +332,16 @@ export default function ClientOnlyPaymentPage({
         .then(result => {
           if (result.success && result.qrDataURL) {
             setGeneratedQR(result.qrDataURL);
-          } else {
-            // QR generation failed
           }
         })
         .catch(() => {
-          // QR generation error
+          // QR generation failed - will fallback to VietQR URL
         })
         .finally(() => {
           setQrLoading(false);
         });
     }
   }, [paymentData, isClient]);
-
-  // Use merchant logo from appConfig if not provided
-  // IMPORTANT: Calculate this BEFORE any early returns so it's available in loading screens
-  const merchantLogo = useMemo(() => {
-    if (!paymentData) return '/icons/esomar-logo.png';
-    return paymentData.merchantLogoUrl || '/icons/esomar-logo.png';
-  }, [paymentData]);
 
   // Use the generated QR or the one from server
   const qrCodeUrl = useMemo(() => {
@@ -400,6 +365,12 @@ export default function ClientOnlyPaymentPage({
     
     return null;
   }, [paymentData, generatedQR]);
+
+  // Use merchant logo from appConfig if not provided
+  const merchantLogo = useMemo(() => {
+    if (!paymentData) return '/icons/esomar-logo.png';
+    return paymentData.merchantLogoUrl || '/icons/esomar-logo.png';
+  }, [paymentData]);
 
   // Handle error state
   if (error) {
@@ -466,36 +437,16 @@ export default function ClientOnlyPaymentPage({
     );
   }
 
-  // Show loading state while fetching current status from Supabase
-  if (isLoadingStatus) {
+  // Show loading spinner while fetching current status from database
+  // This prevents showing stale status from URL (e.g., "processing") when order is already "completed"
+  if (!statusLoaded) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100 p-4">
-        <div className="w-full max-w-md bg-white rounded-xl shadow-lg overflow-hidden">
-          {/* Logo and Header */}
-          <div className="bg-gradient-to-r from-blue-600 to-blue-800 px-6 py-6 text-white text-center">
-            <div className="mb-2">
-              <Image
-                src={merchantLogo}
-                alt="Payment Logo"
-                width={200}
-                height={100}
-                style={{ width: "auto", height: "auto" }}
-                className="mx-auto"
-                priority
-              />
-            </div>
-            <h1 className="text-2xl font-bold">Đang tải thông tin...</h1>
-          </div>
-
-          {/* Loading Content */}
-          <div className="px-6 py-8 text-center">
-            <div className="mx-auto h-16 w-16 animate-spin rounded-full border-4 border-gray-200 border-t-blue-600"></div>
-            <p className="mt-4 text-gray-600">Đang kiểm tra trạng thái đơn hàng...</p>
-          </div>
-
-          {/* Footer */}
-          <div className="px-6 py-3 bg-gray-100 text-center text-xs text-gray-500">
-            <p>© 2025 {paymentData.merchantName} | Protected and Encrypted</p>
+      <div className="flex flex-col items-center justify-center min-h-screen bg-gray-50 p-4">
+        <div className="w-full max-w-md p-8 bg-white rounded-lg shadow-lg">
+          <div className="text-center">
+            <div className="inline-block animate-spin rounded-full h-16 w-16 border-b-2 border-blue-600"></div>
+            <h1 className="mt-4 text-xl font-bold text-gray-800">Đang tải...</h1>
+            <p className="mt-2 text-gray-600">Vui lòng đợi trong giây lát</p>
           </div>
         </div>
       </div>
