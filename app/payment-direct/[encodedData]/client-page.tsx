@@ -73,10 +73,8 @@ function downloadQRCode(qrCodeData: string, orderId: string): void {
 
 export default function ClientOnlyPaymentPage({
   initialData,
-  encodedData, // eslint-disable-line @typescript-eslint/no-unused-vars
 }: {
   initialData: ApiResponse;
-  encodedData: string;
 }) {
   // Memoize initial error state
   const error = useMemo(

@@ -320,7 +320,7 @@ export async function POST(request: NextRequest) {
 }
 
 /**
- * Sync bank transaction entries from Supabase to Appwrite
+ * Sync bank transaction entries from Supabase to Appwrite - FAST BATCH PROCESSING
  */
 async function syncBankEntries(
   service: BankTransactionEntryService,
@@ -346,70 +346,82 @@ async function syncBankEntries(
 
     await log.info(`Found ${entries.length} unsynced bank entries`);
 
-    // Process each entry
-    for (const entry of entries) {
-      try {
-        if (dryRun) {
-          // Just log what would be synced
-          await log.info('DRY RUN: Would sync bank entry', {
-            id: entry.id,
-            portalTransactionId: entry.portal_transaction_id,
-            odrId: entry.odr_id,
-            amount: entry.amount
-          });
-          result.synced++;
-          continue;
-        }
+    // Process entries in batches of 10 (parallel processing)
+    const BATCH_SIZE = 10;
+    for (let i = 0; i < entries.length; i += BATCH_SIZE) {
+      const batch = entries.slice(i, i + BATCH_SIZE);
+      
+      await Promise.all(
+        batch.map(async (entry) => {
+          try {
+            if (dryRun) {
+              await log.info('DRY RUN: Would sync bank entry', {
+                id: entry.id,
+                portalTransactionId: entry.portal_transaction_id,
+                odrId: entry.odr_id,
+                amount: entry.amount
+              });
+              result.synced++;
+              return;
+            }
 
-        // Create entry in Appwrite
-        const bankTransactionData: BankTransactionEntryData = {
-          portalId: entry.portal_id,
-          portalTransactionId: entry.portal_transaction_id,
-          odrId: entry.odr_id || 'UNKNOWN',
-          bankId: entry.bank_id,
-          bankName: entry.bank_name || '',
-          bankAccountNumber: entry.bank_account_number || '',
-          amount: entry.amount,
-          transactionType: entry.transaction_type || 'credit',
-          balanceAfter: entry.balance_after || 0,
-          transactionDate: entry.created_at || new Date().toISOString(),
-          rawPayload: '',
-          status: entry.status || 'pending',
-          notes: `${entry.notes || ''} | Synced from Supabase backup on ${new Date().toISOString()}`
-        };
+            // Create entry in Appwrite
+            const bankTransactionData: BankTransactionEntryData = {
+              portalId: entry.portal_id,
+              portalTransactionId: entry.portal_transaction_id,
+              odrId: entry.odr_id || 'UNKNOWN',
+              bankId: entry.bank_id,
+              bankName: entry.bank_name || '',
+              bankAccountNumber: entry.bank_account_number || '',
+              amount: entry.amount,
+              transactionType: entry.transaction_type || 'credit',
+              balanceAfter: entry.balance_after || 0,
+              transactionDate: entry.created_at || new Date().toISOString(),
+              rawPayload: '',
+              status: entry.status || 'pending',
+              notes: `${entry.notes || ''} | Synced from Supabase backup on ${new Date().toISOString()}`
+            };
 
-        const createResult = await createBankTransactionEntry(bankTransactionData);
+            const createResult = await createBankTransactionEntry(bankTransactionData);
 
-        if (createResult.success && createResult.entry) {
-          // Mark as synced in Supabase
-          await service.markEntrySynced(entry.id!, createResult.entry.$id);
-          
-          await log.info('Bank entry synced successfully', {
-            supabaseId: entry.id,
-            appwriteId: createResult.entry.$id
-          });
-          result.synced++;
-        } else {
-          throw new Error(createResult.message || 'Failed to create entry in Appwrite');
-        }
+            if (createResult.success && createResult.entry) {
+              // Mark as synced in Supabase
+              await service.markEntrySynced(entry.id!, createResult.entry.$id);
+              result.synced++;
+            } else {
+              throw new Error(createResult.message || 'Failed to create entry in Appwrite');
+            }
 
-      } catch (error) {
-        const errorMsg = `Entry ${entry.id}: ${error instanceof Error ? error.message : String(error)}`;
-        result.errors.push(errorMsg);
-        result.failed++;
-        
-        // Record sync failure in Supabase
-        await service.recordEntrySyncFailure(
-          entry.id!,
-          error instanceof Error ? error.message : String(error)
-        );
-        
-        await log.error('Failed to sync bank entry', error instanceof Error ? error : new Error(String(error)), {
-          entryId: entry.id,
-          portalTransactionId: entry.portal_transaction_id
+          } catch (error) {
+            const errorMsg = `Entry ${entry.id}: ${error instanceof Error ? error.message : String(error)}`;
+            result.errors.push(errorMsg);
+            result.failed++;
+            
+            // Record sync failure in Supabase
+            await service.recordEntrySyncFailure(
+              entry.id!,
+              error instanceof Error ? error.message : String(error)
+            );
+          }
+        })
+      );
+
+      // Log progress every 50 entries
+      if ((i + BATCH_SIZE) % 50 === 0 || (i + BATCH_SIZE) >= entries.length) {
+        await log.info('Bank entries sync progress', {
+          processed: Math.min(i + BATCH_SIZE, entries.length),
+          total: entries.length,
+          synced: result.synced,
+          failed: result.failed
         });
       }
     }
+
+    await log.info('All bank entries processed', {
+      total: result.processed,
+      synced: result.synced,
+      failed: result.failed
+    });
 
   } catch (error) {
     result.errors.push(`Failed to fetch entries: ${error instanceof Error ? error.message : String(error)}`);
@@ -520,7 +532,7 @@ async function syncBankEntriesByOrderIds(
 }
 
 /**
- * Sync orders from Supabase to Appwrite
+ * Sync orders from Supabase to Appwrite - FAST BATCH PROCESSING
  */
 async function syncOrders(
   service: BackupOrderService,
@@ -556,88 +568,146 @@ async function syncOrders(
 
     await log.info(`Found ${orders.length} unsynced orders`, { filters });
 
-    // Process each order
-    for (const order of orders) {
-      try {
-        if (dryRun) {
-          // Just log what would be synced
-          await log.info('DRY RUN: Would sync order', {
-            odrId: order.odr_id,
-            amount: order.amount,
-            status: order.odr_status,
-            merchantId: order.merchant_id
-          });
-          result.synced++;
-          result.syncedOrderIds.push(order.odr_id);
-          continue;
-        }
+    // Get database connection once
+    const { database } = await createAdminClient();
 
-        // Create order in Appwrite
-        const { database } = await createAdminClient();
-        
-        // Only include fields that exist in Appwrite OrderTransaction schema
-        const orderData = {
-          odrId: order.odr_id,
-          merchantOrdId: order.merchant_odr_id || '',
-          odrType: order.odr_type,
-          odrStatus: order.odr_status,
-          amount: order.amount,
-          paidAmount: order.paid_amount || 0,
-          unPaidAmount: order.unpaid_amount,
-          positiveAccount: order.merchant_id,
-          negativeAccount: '',
-          bankId: order.bank_id || '',
-          // NOTE: bankName, accountNumber, accountName don't exist in Appwrite schema - removed
-          qrCode: order.qr_code || null,
-          bankCode: order.bank_code || '',
-          bankReceiveNumber: order.bank_receive_number || '',
-          bankReceiveOwnerName: order.bank_receive_owner_name || '',
-          bankReceiveName: order.bank_receive_name || '',
-          urlSuccess: order.url_success || '',
-          urlFailed: order.url_failed || '',
-          urlCanceled: order.url_canceled || '',
-          urlCallBack: order.url_callback,
-          createdIp: order.created_ip || 'sync-from-backup',
-          isSuspicious: order.is_suspicious || false,
-          lastPaymentDate: order.last_payment_date || new Date().toISOString(),
-          account: order.merchant_id // Required field for OrderTransaction
-        };
+    // Build merchant ID to account document ID cache
+    const merchantIds = [...new Set(orders.map(o => o.merchant_id))];
+    const accountCache = new Map<string, string>();
 
-        const createdOrder = await database.createDocument(
-          appwriteConfig.databaseId,
-          appwriteConfig.odrtransCollectionId,
-          ID.unique(),
-          orderData
-        );
+    await log.info('Building account cache', { merchantCount: merchantIds.length });
 
-        // Mark as synced
-        await service.markOrderSynced(order.odr_id, createdOrder.$id);
-        
-        await log.info('Order synced successfully', {
-          odrId: order.odr_id,
-          supabaseId: order.id,
-          appwriteId: createdOrder.$id
-        });
-        
-        result.synced++;
-        result.syncedOrderIds.push(order.odr_id);
+    // Fetch all merchant accounts in parallel (batch of 10)
+    const BATCH_SIZE = 10;
+    for (let i = 0; i < merchantIds.length; i += BATCH_SIZE) {
+      const batch = merchantIds.slice(i, i + BATCH_SIZE);
+      await Promise.all(
+        batch.map(async (merchantId) => {
+          try {
+            const accounts = await database.listDocuments(
+              appwriteConfig.databaseId,
+              appwriteConfig.accountsCollectionId,
+              [`equal("accountId", "${merchantId}")`]
+            );
+            if (accounts.documents.length > 0) {
+              accountCache.set(merchantId, accounts.documents[0].$id);
+            }
+          } catch (error) {
+            await log.error('Failed to fetch account', error instanceof Error ? error : new Error(String(error)), {
+              merchantId
+            });
+          }
+        })
+      );
+    }
 
-      } catch (error) {
-        const errorMsg = `Order ${order.odr_id}: ${error instanceof Error ? error.message : String(error)}`;
-        result.errors.push(errorMsg);
-        result.failed++;
-        
-        // Record sync failure in Supabase
-        await service.recordSyncFailure(
-          order.odr_id,
-          error instanceof Error ? error.message : String(error)
-        );
-        
-        await log.error('Failed to sync order', error instanceof Error ? error : new Error(String(error)), {
-          odrId: order.odr_id
+    await log.info('Account cache built', { cached: accountCache.size });
+
+    // Process orders in batches of 5 (parallel processing)
+    const PROCESS_BATCH_SIZE = 5;
+    for (let i = 0; i < orders.length; i += PROCESS_BATCH_SIZE) {
+      const batch = orders.slice(i, i + PROCESS_BATCH_SIZE);
+      
+      await Promise.all(
+        batch.map(async (order) => {
+          try {
+            if (dryRun) {
+              await log.info('DRY RUN: Would sync order', {
+                odrId: order.odr_id,
+                amount: order.amount,
+                status: order.odr_status,
+                merchantId: order.merchant_id
+              });
+              result.synced++;
+              result.syncedOrderIds.push(order.odr_id);
+              return;
+            }
+
+            // Get account document ID based on order type
+            let accountDocumentId: string | undefined;
+            
+            if (order.odr_type === 'deposit') {
+              // For deposit: use positiveAccount (merchant receives money)
+              accountDocumentId = accountCache.get(order.merchant_id);
+            } else if (order.odr_type === 'withdraw') {
+              // For withdraw: use negativeAccount (merchant sends money)
+              accountDocumentId = accountCache.get(order.merchant_id);
+            }
+
+            if (!accountDocumentId) {
+              throw new Error(`Account document not found for merchant: ${order.merchant_id}`);
+            }
+
+            // Build order data with correct account relationship
+            const orderData = {
+              odrId: order.odr_id,
+              merchantOrdId: order.merchant_odr_id || '',
+              odrType: order.odr_type,
+              odrStatus: order.odr_status,
+              amount: order.amount,
+              paidAmount: order.paid_amount || 0,
+              unPaidAmount: order.unpaid_amount,
+              positiveAccount: order.odr_type === 'deposit' ? order.merchant_id : '',
+              negativeAccount: order.odr_type === 'withdraw' ? order.merchant_id : '',
+              bankId: order.bank_id || '',
+              qrCode: order.qr_code || null,
+              bankCode: order.bank_code || '',
+              bankReceiveNumber: order.bank_receive_number || '',
+              bankReceiveOwnerName: order.bank_receive_owner_name || '',
+              bankReceiveName: order.bank_receive_name || '',
+              urlSuccess: order.url_success || '',
+              urlFailed: order.url_failed || '',
+              urlCanceled: order.url_canceled || '',
+              urlCallBack: order.url_callback,
+              createdIp: order.created_ip || 'sync-from-backup',
+              isSuspicious: order.is_suspicious || false,
+              lastPaymentDate: order.last_payment_date || new Date().toISOString(),
+              account: accountDocumentId // Correct account document ID
+            };
+
+            const createdOrder = await database.createDocument(
+              appwriteConfig.databaseId,
+              appwriteConfig.odrtransCollectionId,
+              ID.unique(),
+              orderData
+            );
+
+            // Mark as synced
+            await service.markOrderSynced(order.odr_id, createdOrder.$id);
+            
+            result.synced++;
+            result.syncedOrderIds.push(order.odr_id);
+
+          } catch (error) {
+            const errorMsg = `Order ${order.odr_id}: ${error instanceof Error ? error.message : String(error)}`;
+            result.errors.push(errorMsg);
+            result.failed++;
+            
+            // Record sync failure
+            await service.recordSyncFailure(
+              order.odr_id,
+              error instanceof Error ? error.message : String(error)
+            );
+          }
+        })
+      );
+
+      // Log progress every batch
+      if ((i + PROCESS_BATCH_SIZE) % 50 === 0 || (i + PROCESS_BATCH_SIZE) >= orders.length) {
+        await log.info('Sync progress', {
+          processed: Math.min(i + PROCESS_BATCH_SIZE, orders.length),
+          total: orders.length,
+          synced: result.synced,
+          failed: result.failed
         });
       }
     }
+
+    await log.info('All orders processed', {
+      total: result.processed,
+      synced: result.synced,
+      failed: result.failed
+    });
 
   } catch (error) {
     result.errors.push(`Failed to fetch orders: ${error instanceof Error ? error.message : String(error)}`);
