@@ -68,8 +68,8 @@ export async function fetchTransbotTransactionsSecure(params: FetchTransactionsP
 
   try {
     // Get environment variables from server-side (secure)
-    const SUPABASE_FUNCTION_URL = process.env.NEXT_PUBLIC_SUPABASE_FUNCTION_URL;
-    const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_FUNCTION_ANON_KEY;
+    const SUPABASE_FUNCTION_URL = process.env.TRANSBOT_SUPABASE_FUNCTION_URL;
+    const SUPABASE_ANON_KEY = process.env.TRANSBOT_SUPABASE_FUNCTION_ANON_KEY;
 
     if (!SUPABASE_FUNCTION_URL || !SUPABASE_ANON_KEY) {
       console.error('Missing environment variables:', { 
@@ -144,8 +144,8 @@ export async function fetchTransbotTransactionsSecure(params: FetchTransactionsP
 // Additional server action for creating transactions via API
 export async function createTransbotTransaction(transactionData: Partial<SupabaseTransaction>) {
   try {
-    const SUPABASE_FUNCTION_URL = process.env.NEXT_PUBLIC_SUPABASE_FUNCTION_URL;
-    const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_FUNCTION_ANON_KEY;
+    const SUPABASE_FUNCTION_URL = process.env.TRANSBOT_SUPABASE_FUNCTION_URL;
+    const SUPABASE_ANON_KEY = process.env.TRANSBOT_SUPABASE_FUNCTION_ANON_KEY;
 
     if (!SUPABASE_FUNCTION_URL || !SUPABASE_ANON_KEY) {
       throw new Error('Missing Supabase configuration');
@@ -182,8 +182,8 @@ export async function createTransbotTransaction(transactionData: Partial<Supabas
 // Additional server action for updating transactions via API
 export async function updateTransbotTransaction(id: number, updates: Partial<SupabaseTransaction>) {
   try {
-    const SUPABASE_FUNCTION_URL = process.env.NEXT_PUBLIC_SUPABASE_FUNCTION_URL;
-    const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_FUNCTION_ANON_KEY;
+    const SUPABASE_FUNCTION_URL = process.env.TRANSBOT_SUPABASE_FUNCTION_URL;
+    const SUPABASE_ANON_KEY = process.env.TRANSBOT_SUPABASE_FUNCTION_ANON_KEY;
 
     if (!SUPABASE_FUNCTION_URL || !SUPABASE_ANON_KEY) {
       throw new Error('Missing Supabase configuration');
@@ -220,8 +220,8 @@ export async function updateTransbotTransaction(id: number, updates: Partial<Sup
 // Additional server action for deleting transactions via API
 export async function deleteTransbotTransaction(id: number, chatId: string) {
   try {
-    const SUPABASE_FUNCTION_URL = process.env.NEXT_PUBLIC_SUPABASE_FUNCTION_URL;
-    const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_FUNCTION_ANON_KEY;
+    const SUPABASE_FUNCTION_URL = process.env.TRANSBOT_SUPABASE_FUNCTION_URL;
+    const SUPABASE_ANON_KEY = process.env.TRANSBOT_SUPABASE_FUNCTION_ANON_KEY;
 
     if (!SUPABASE_FUNCTION_URL || !SUPABASE_ANON_KEY) {
       throw new Error('Missing Supabase configuration');

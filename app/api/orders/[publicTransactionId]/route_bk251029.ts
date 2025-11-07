@@ -1,22 +1,23 @@
 import { NextRequest, NextResponse } from "next/server";
 import { OrderTransaction } from "@/types";
 import { formatAmount, generateUniqueString, verifyApiKeyAndAccount } from "@/lib/utils";
-import { MerchantCacheService } from "@/lib/cache/merchant-cache";
+import { Query } from "appwrite";
+import { createAdminClient } from "@/lib/appwrite/appwrite.actions";
 import { appwriteConfig } from "@/lib/appwrite/appwrite-config";
 import { log, captureRequestDetails } from "@/lib/logger";
 import { dbManager } from "@/lib/database/connection-manager";
-import { Query } from "node-appwrite";
 
 import { appConfig, getPaymentBaseUrl } from "@/lib/appconfig";
-import { getBankById } from "@/lib/actions/bank.actions";
+import { chkBanksControl, getBankById } from "@/lib/actions/bank.actions";
 import { createEncodedPaymentUrl, type PaymentData } from "@/lib/payment-encoder";
 import { getAccount } from "@/lib/actions/account.actions";
-import { BackupOrderService } from "@/lib/supabase-backup";
+import { MerchantAccountCacheService, BackupOrderService } from "@/lib/supabase-backup";
 
 import { createTransactionOptimized, getProcessingWithdrawalsTotal } from "@/lib/actions/transaction.actions";
 import { LRUCache } from 'lru-cache';
 import { NotificationQueue } from "@/lib/background/notification-queue";
 import { BulkRateLimiter } from "@/lib/rate-limit";
+import { VietQRService } from "@/lib/vietqr-api";
 import QRLocal from "@/lib/qr_local";
 
 // OPTIMIZATION: Pre-import heavy modules to reduce runtime import overhead
@@ -24,15 +25,6 @@ import { updateAccountBalance } from "@/lib/actions/account.actions";
 import { getReadyWithdrawUsers, getUserDocumentId } from "@/lib/actions/user.actions";
 import { assignWithdrawalToUser } from "@/lib/actions/withdraw.actions";
 import { updateTransactionStatus } from "@/lib/actions/transaction.actions";
-
-// NEW: Database health check for automatic failover
-import { selectHealthyDatabase } from "@/lib/database/health-check";
-
-// NEW: Fallback merchant validation when databases are down
-import { validateMerchantFallback, getMerchantLimitsFallback } from "@/lib/fallback-merchant-validation";
-
-// NEW: Dynamic order prefix based on database
-import { getDynamicOrderPrefix } from "@/lib/appconfig";
 
 // SECURITY LIMITS: Prevent system abuse and resource exhaustion
 const SECURITY_LIMITS = {
@@ -56,6 +48,8 @@ const notificationCache = new LRUCache<string, number>({
   max: 1000, // Maximum items in cache
   ttl: 300000, // 5 minutes TTL
 });
+
+const qrTemplateCode = appConfig.qrTemplateCode;
 
 // Function to check if notification should be sent (rate limited to 1 per minute)
 function shouldSendNotification(merchantId: string): boolean {
@@ -110,6 +104,15 @@ async function validateCreateOrderFields(
     withdrawWhitelistIps?: string[];
   }
 ): Promise<{ valid: boolean; message: string; bankReceiveName?: string }> {
+  // DEBUG: Log client-only mode configuration
+  console.log('🔧 DEBUG validateCreateOrderFields:', {
+    useClientOnlyPayment: appConfig.useClientOnlyPayment,
+    envVar: process.env.USE_CLIENT_ONLY_PAYMENT,
+    odrType: data.odrType,
+    bankId: data.bankId,
+    bankCode: data.bankCode
+  });
+  
   // Check common required fields  
   if (!data.odrType) {
     return { valid: false, message: "Missing required field: odrType" };
@@ -158,9 +161,60 @@ async function validateCreateOrderFields(
       return { valid: false, message: `Deposit amount cannot exceed ${merchantAccount.maxDepositAmount}` };
     }
 
-    // OPTIMIZATION: Skip bank validation in validation step (saves ~180ms)
-    // Bank validation is done later in processSingleOrderOptimized with getBankById + fallback
-    // This allows for fast validation while still ensuring bank exists during order processing
+    // Validate bankId against transactorBanks
+    try {
+      // Get admin client
+      const { database } = await createAdminClient();
+
+      // Check if bankId exists in transactor's active banks
+      const bankDoc = await database.listDocuments(
+        DATABASE_ID,
+        appwriteConfig.banksCollectionId,
+        [
+          Query.equal("isActivated", [true]),
+          Query.equal("bankId", [data.bankId]),
+          Query.limit(1)
+        ]
+      );
+
+      if (!bankDoc || bankDoc.documents.length === 0) {
+        return { valid: false, message: "Invalid or inactive bank ID" };
+      }
+    } catch (error) {
+      // Log detailed error information for debugging
+      console.error("Error validating bank ID:", {
+        error,
+        errorMessage: error instanceof Error ? error.message : 'Unknown error',
+        errorName: error instanceof Error ? error.name : 'Unknown',
+        clientOnlyMode: appConfig.useClientOnlyPayment,
+        bankId: data.bankId
+      });
+      
+      // If client-only mode is enabled, ALWAYS skip validation when ANY database error occurs
+      if (appConfig.useClientOnlyPayment) {
+        console.warn(`Bank validation skipped (database error, client-only mode enabled): ${data.bankId}`);
+        return { valid: true, message: "" };
+      }
+      
+      // Check if this is a database connectivity error (for non-client-only mode)
+      if (error instanceof Error && 
+          (error.message?.includes('fetch failed') || 
+           error.message?.includes('ECONNREFUSED') ||
+           error.message?.includes('network') ||
+           error.message?.includes('timeout') ||
+           error.message?.includes('AppwriteException') ||
+           error.message?.includes('connect') ||
+           error.message?.includes('refused'))) {
+        
+        return { 
+          valid: false, 
+          message: "Database temporarily unavailable. Unable to validate bank ID. Please try again or contact support." 
+        };
+      }
+      
+      // For other errors in non-client-only mode, return generic validation failure
+      return { valid: false, message: "Invalid bank ID" };
+    }
   } else if (data.odrType === 'withdraw') {
     if (!data.bankCode || data.bankCode.trim() === '') {
       return { valid: false, message: "bankCode is required" };
@@ -195,18 +249,65 @@ async function validateCreateOrderFields(
       return { valid: false, message: `Withdraw amount cannot exceed ${merchantAccount.maxWithdrawAmount}` };
     }
 
-    // OPTIMIZATION: Use local-only bank validation (skip database blacklist check for speed)
-    // Blacklist check is expensive (~100-150ms), use local validation only
-    // If you need blacklist, move it to background processing after order creation
-    
-    // Use local bank validation (fast, no database query)
-    if (!QRLocal.isSupportedBankBin(data.bankCode)) {
-      return { valid: false, message: `Bank code ${data.bankCode} is not supported by the local QR system` };
+    // Validate bankCode against bankBlackList & bankList
+    try {
+      const bankBlackList = await chkBanksControl({ bankCode: data.bankCode, bankNumber: data.bankReceiveNumber });
+
+      if (!bankBlackList || bankBlackList.success) {
+        return { valid: false, message: bankBlackList.message || "Withdrawal bank is blacklisted!!!" };
+      }
+
+      // Use local bank validation instead of VietQR API
+      if (!QRLocal.isSupportedBankBin(data.bankCode)) {
+        return { valid: false, message: `Bank code ${data.bankCode} is not supported by the local QR system` };
+      }
+      
+      // Get bank name from local database
+      const bankName = QRLocal.getBankNameFromBin(data.bankCode);
+      return { valid: true, message: '', bankReceiveName: bankName || 'Unknown Bank' };
+    } catch (error) {
+      // Log detailed error information for debugging
+      console.error("Error validating bank code:", {
+        error,
+        errorMessage: error instanceof Error ? error.message : 'Unknown error',
+        errorName: error instanceof Error ? error.name : 'Unknown',
+        clientOnlyMode: appConfig.useClientOnlyPayment,
+        bankCode: data.bankCode
+      });
+      
+      // If client-only mode is enabled, ALWAYS skip blacklist check when ANY database error occurs
+      if (appConfig.useClientOnlyPayment) {
+        console.warn(`Bank blacklist check skipped (database error, client-only mode enabled): ${data.bankCode}`);
+        
+        // Still validate bank code locally
+        if (!QRLocal.isSupportedBankBin(data.bankCode)) {
+          return { valid: false, message: `Bank code ${data.bankCode} is not supported by the local QR system` };
+        }
+        
+        // Get bank name from local database
+        const bankName = QRLocal.getBankNameFromBin(data.bankCode);
+        return { valid: true, message: '', bankReceiveName: bankName || 'Unknown Bank' };
+      }
+      
+      // Check if this is a database connectivity error (for non-client-only mode)
+      if (error instanceof Error && 
+          (error.message?.includes('fetch failed') || 
+           error.message?.includes('ECONNREFUSED') ||
+           error.message?.includes('network') ||
+           error.message?.includes('timeout') ||
+           error.message?.includes('AppwriteException') ||
+           error.message?.includes('connect') ||
+           error.message?.includes('refused'))) {
+        
+        return { 
+          valid: false, 
+          message: "Database temporarily unavailable. Unable to validate bank. Please try again or contact support." 
+        };
+      }
+      
+      // For other errors in non-client-only mode, return generic validation failure
+      return { valid: false, message: 'Could not validate bank code due to API error' };
     }
-    
-    // Get bank name from local database (fast, in-memory)
-    const bankName = QRLocal.getBankNameFromBin(data.bankCode);
-    return { valid: true, message: '', bankReceiveName: bankName || 'Unknown Bank' };
   }
 
   return { valid: true, message: '' };
@@ -224,16 +325,13 @@ function formatTimestamp(isoTimestamp: string): string {
   return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
 }
 
-function generateOrderId(activeDatabase: 'appwrite' | 'supabase' | 'none'): string {
+function generateOrderId(): string {
   // Get current date in YYYYMMDD format  
   const now = new Date();
   const year = now.getFullYear();
   const month = String(now.getMonth() + 1).padStart(2, '0');
   const day = String(now.getDate()).padStart(2, '0');
-  
-  // Get dynamic prefix based on active database
-  const firstprefix = getDynamicOrderPrefix(activeDatabase);
-  
+  const firstprefix = appConfig.odrPrefix;
   const datePrefix = `${year}${month}${day}`;
 
   // Generate 7 random characters  
@@ -508,12 +606,11 @@ export async function POST(
     // Step 1: API Key validation
     const apiKey = request.headers.get('x-api-key');
     if (!apiKey) {
-      // OPTIMIZATION: Only capture details in error cases, skip expensive body parsing
+      const requestDetails = await captureRequestDetails(request);
       await log.warn('POST orders: Missing API key', { 
         merchantId: publicTransactionId, 
         clientIp,
-        method: request.method,
-        url: request.url
+        requestDetails
       });
       return NextResponse.json(
         { success: false, message: 'API key is required' },
@@ -624,118 +721,40 @@ export async function POST(
       );
     }
 
-    // NEW: Health check - determine which database to use (Appwrite priority, Supabase fallback, JSON fallback)
-    const healthyDatabase = await selectHealthyDatabase();
-
-    // OPTIMIZATION: Verify merchant with multi-layer cache (L1 in-memory -> L2 Supabase -> L3 Database)
-    // Expected performance: L1 hit ~0.1ms (99.99% faster), L2 hit ~50ms (97% faster), L3 miss ~1500ms
-    const merchantVerifyStart = performance.now();
+    // Verify merchant account
+    // When useClientOnlyPayment is enabled, use Supabase cache instead of querying main database
     let merchantAccount;
     
-    try {
-      const cachedMerchant = await MerchantCacheService.getMerchantAccount(
-        apiKey,
-        publicTransactionId,
-        healthyDatabase
-      );
+    if (appConfig.useClientOnlyPayment) {
+      // Use Supabase cache for merchant verification
+      const merchantCacheService = new MerchantAccountCacheService();
+      const cachedMerchant = await merchantCacheService.getMerchantByApiKey(apiKey, publicTransactionId);
       
       if (!cachedMerchant) {
-        // OPTIMIZATION: Skip expensive captureRequestDetails in hot path
-        await log.warn('POST orders: Invalid API key or account', { 
-          merchantId: publicTransactionId,
-          clientIp,
-          database: healthyDatabase,
-          verificationTime: Math.round(performance.now() - merchantVerifyStart),
-          apiKeyPrefix: apiKey.substring(0, 8) + '...'
-        });
-        return NextResponse.json(
-          { success: false, message: 'Invalid API key or account' },
-          { status: 401 }
-        );
-      }
-      
-      // Convert to expected format
-      merchantAccount = {
-        $id: cachedMerchant.$id,
-        publicTransactionId: cachedMerchant.publicTransactionId,
-        depositWhitelistIps: cachedMerchant.depositWhitelistIps || [],
-        withdrawWhitelistIps: cachedMerchant.withdrawWhitelistIps || [],
-        avaiableBalance: cachedMerchant.avaiableBalance || 0,
-        minDepositAmount: cachedMerchant.minDepositAmount,
-        maxDepositAmount: cachedMerchant.maxDepositAmount,
-        minWithdrawAmount: cachedMerchant.minWithdrawAmount,
-        maxWithdrawAmount: cachedMerchant.maxWithdrawAmount,
-      } as {
-        $id: string;
-        publicTransactionId: string;
-        minDepositAmount?: number;
-        maxDepositAmount?: number;
-        minWithdrawAmount?: number;
-        maxWithdrawAmount?: number;
-        avaiableBalance: number;
-        depositWhitelistIps?: string[];
-        withdrawWhitelistIps?: string[];
-      };
-      
-      const merchantVerifyTime = Math.round(performance.now() - merchantVerifyStart);
-      console.log(`✅ Merchant verified in ${merchantVerifyTime}ms (cache: ${healthyDatabase})`);
-      
-    } catch (dbError) {
-      // Keep detailed logging for actual errors
-      const requestDetails = await captureRequestDetails(request);
-      await log.error('POST orders: Merchant verification error', 
-        dbError instanceof Error ? dbError : new Error(String(dbError)), { 
-        merchantId: publicTransactionId,
-        clientIp,
-        requestDetails,
-        database: healthyDatabase,
-        verificationTime: Math.round(performance.now() - merchantVerifyStart)
-      });
-      return NextResponse.json(
-        { 
-          success: false, 
-          message: 'Database temporarily unavailable. Please try again.',
-          error: 'DB_CONNECTION_ERROR'
-        },
-        { status: 503 }
-      );
-    }
-    
-    // JSON Fallback mode (only if both databases are unhealthy and cache miss)
-    if (!merchantAccount && healthyDatabase === 'none') {
-      // Fallback 2: Both databases unhealthy - use JSON fallback
-      const fallbackResult = validateMerchantFallback(apiKey, clientIp, 'deposit');
-      
-      if (!fallbackResult.success) {
         const requestDetails = await captureRequestDetails(request);
-        await log.warn('POST orders: Fallback validation failed', { 
+        await log.warn('POST orders: Invalid API key or account (Supabase cache)', { 
           merchantId: publicTransactionId,
           clientIp,
           requestDetails,
-          database: 'json-fallback',
-          error: fallbackResult.error
+          cacheMode: 'supabase'
         });
         return NextResponse.json(
-          { success: false, message: fallbackResult.error || 'Invalid API key or account' },
+          { success: false, message: 'Invalid API key or account. Please ensure merchant is cached in Supabase.' },
           { status: 401 }
         );
       }
       
-      // Get merchant limits from fallback
-      const limits = getMerchantLimitsFallback(fallbackResult.merchantId!, 'deposit');
-      const withdrawLimits = getMerchantLimitsFallback(fallbackResult.merchantId!, 'withdraw');
-      
-      // Create merchant account from fallback data
+      // Convert cached merchant to expected format (Supabase uses snake_case)
       merchantAccount = {
-        $id: fallbackResult.accountId!,
-        publicTransactionId: fallbackResult.merchantId!,
-        depositWhitelistIps: [], // Already validated by fallback
-        withdrawWhitelistIps: [], // Already validated by fallback
-        avaiableBalance: 0, // No balance tracking in fallback mode
-        minDepositAmount: limits?.minAmount,
-        maxDepositAmount: limits?.maxAmount,
-        minWithdrawAmount: withdrawLimits?.minAmount,
-        maxWithdrawAmount: withdrawLimits?.maxAmount,
+        $id: cachedMerchant.appwrite_doc_id || cachedMerchant.merchant_id,
+        publicTransactionId: cachedMerchant.merchant_id,
+        depositWhitelistIps: cachedMerchant.deposit_whitelist_ips || [],
+        withdrawWhitelistIps: cachedMerchant.withdraw_whitelist_ips || [],
+        avaiableBalance: cachedMerchant.available_balance || 0,
+        minDepositAmount: cachedMerchant.min_deposit_amount,
+        maxDepositAmount: cachedMerchant.max_deposit_amount,
+        minWithdrawAmount: cachedMerchant.min_withdraw_amount,
+        maxWithdrawAmount: cachedMerchant.max_withdraw_amount,
       } as {
         $id: string;
         publicTransactionId: string;
@@ -747,12 +766,42 @@ export async function POST(
         depositWhitelistIps?: string[];
         withdrawWhitelistIps?: string[];
       };
-      
-      await log.info('POST orders: Using JSON fallback for merchant verification', {
-        merchantId: fallbackResult.merchantId,
-        clientIp,
-        database: 'json-fallback'
-      });
+    } else {
+      // Normal mode: query main database
+      try {
+        merchantAccount = await verifyApiKeyAndAccount(apiKey, publicTransactionId);
+        if (!merchantAccount) {
+          const requestDetails = await captureRequestDetails(request);
+          await log.warn('POST orders: Invalid API key or account', { 
+            merchantId: publicTransactionId,
+            clientIp,
+            requestDetails
+          });
+          return NextResponse.json(
+            { success: false, message: 'Invalid API key or account' },
+            { status: 401 }
+          );
+        }
+      } catch (dbError) {
+        // Database connection error - suggest fallback mode
+        const requestDetails = await captureRequestDetails(request);
+        await log.error('POST orders: Database connection error during merchant verification', 
+          dbError instanceof Error ? dbError : new Error(String(dbError)), { 
+          merchantId: publicTransactionId,
+          clientIp,
+          requestDetails,
+          suggestion: 'Enable USE_CLIENT_ONLY_PAYMENT=true in .env for resilient operation'
+        });
+        return NextResponse.json(
+          { 
+            success: false, 
+            message: 'Database temporarily unavailable. Please try again or contact support.',
+            error: 'DB_CONNECTION_ERROR',
+            suggestion: 'System administrator: Consider enabling client-only payment mode for resilient operation'
+          },
+          { status: 503 }
+        );
+      }
     }
 
     // Validate all orders
@@ -801,76 +850,6 @@ export async function POST(
       );
     }
     
-    // BUSINESS RULE: Deposits can only be single orders, bulk orders must be all withdrawals
-    if (ordersArray.length > 1) {
-      // Bulk request detected
-      if (depositCount > 0) {
-        await log.warn('POST orders: Bulk deposits not allowed', {
-          merchantId: publicTransactionId,
-          orderCount: ordersArray.length,
-          depositCount,
-          withdrawCount
-        });
-        return NextResponse.json(
-          { 
-            success: false, 
-            message: 'Bulk orders are only allowed for withdrawals. Deposits must be created one at a time. Please separate deposit orders into individual requests.' 
-          },
-          { status: 400 }
-        );
-      }
-      
-      // Ensure all orders are withdrawals
-      if (withdrawCount !== ordersArray.length) {
-        await log.warn('POST orders: Mixed order types in bulk request', {
-          merchantId: publicTransactionId,
-          orderCount: ordersArray.length,
-          depositCount,
-          withdrawCount
-        });
-        return NextResponse.json(
-          { 
-            success: false, 
-            message: 'Bulk requests must contain orders of the same type. Found mixed deposit and withdraw orders.' 
-          },
-          { status: 400 }
-        );
-      }
-    }
-    
-    // FALLBACK MODE: Check if we're in fallback mode and validate order types
-    if (healthyDatabase === 'none') {
-      const { getCoreRunningMode } = await import('@/lib/appconfig');
-      const runningMode = getCoreRunningMode();
-      
-      if (runningMode === 'fallback') {
-        // Fallback mode only supports deposits (withdrawals need balance tracking)
-        if (withdrawCount > 0) {
-          await log.warn('POST orders: Withdrawals not allowed in fallback mode', {
-            merchantId: publicTransactionId,
-            orderCount: ordersArray.length,
-            withdrawCount,
-            database: 'fallback'
-          });
-          return NextResponse.json(
-            { 
-              success: false, 
-              message: 'Fallback mode only supports deposit orders. Withdrawals require database for balance tracking. Please wait for database to be available or contact support.' 
-            },
-            { status: 503 }
-          );
-        }
-        
-        // Log fallback mode usage
-        await log.info('POST orders: Processing in fallback mode', {
-          merchantId: publicTransactionId,
-          orderCount: ordersArray.length,
-          depositCount,
-          database: 'fallback'
-        });
-      }
-    }
-    
     // NOTE: No balance check for withdrawals - business allows negative balances
     // Merchants can withdraw beyond their available balance (credit line model)
 
@@ -884,8 +863,7 @@ export async function POST(
         ordersArray[0] as CreateOrderData, 
         merchantAccount, 
         clientIp, 
-        request,
-        healthyDatabase
+        request
       );
     } else if (ordersArray.length >= 2 && ordersArray.length <= SECURITY_LIMITS.MAX_ORDERS_PARALLEL) {
       processingStrategy = 'parallel-optimized';
@@ -893,8 +871,7 @@ export async function POST(
         ordersArray as CreateOrderData[], 
         merchantAccount, 
         clientIp, 
-        request,
-        healthyDatabase
+        request
       );
     } else if (ordersArray.length >= (SECURITY_LIMITS.MAX_ORDERS_PARALLEL + 1) && ordersArray.length <= SECURITY_LIMITS.MAX_ORDERS_BATCHED) {
       processingStrategy = 'batched-optimized';
@@ -903,8 +880,7 @@ export async function POST(
         merchantAccount, 
         clientIp, 
         request,
-        10,
-        healthyDatabase
+        10
       );
     } else {
       processingStrategy = 'conservative-batched';
@@ -913,18 +889,13 @@ export async function POST(
         merchantAccount, 
         clientIp, 
         request,
-        5,
-        healthyDatabase
+        5
       );
     }
 
     const successCount = processingResults.filter(r => r.success).length;
     const failureCount = processingResults.length - successCount;
     const totalTime = performance.now() - requestStartTime;
-
-    // Get core running mode for detailed logging
-    const { getCoreRunningMode } = await import('@/lib/appconfig');
-    const coreRunningMode = getCoreRunningMode();
 
     // Single consolidated log for all cases (success or failure)
     const firstResult = processingResults[0];
@@ -936,10 +907,7 @@ export async function POST(
       successCount,
       failureCount,
       strategy: processingStrategy,
-      database: {
-        active: healthyDatabase, // Which database was actually used (appwrite/supabase/none)
-        mode: coreRunningMode     // Core running mode (auto/appwrite/supabase/fallback)
-      },
+      mode: appConfig.useClientOnlyPayment ? 'client-only' : 'normal',
       totalTime: Math.round(totalTime),
       clientIp
     };
@@ -949,69 +917,7 @@ export async function POST(
       logData.odrId = firstResult.odrId;
       logData.odrType = firstResult.odrType;
       logData.amount = firstResult.amount;
-      
-      // Calculate overhead time (request parsing, merchant verification, etc.)
-      const orderProcessingTime = firstResult.performance.total;
-      const overheadTime = Math.max(0, Math.round(totalTime - orderProcessingTime));
-      
-      // Complete performance breakdown with all timing phases
-      logData.performance = {
-        // Phase 1: Request overhead (parsing, merchant verification, validation loops)
-        requestOverhead: overheadTime,
-        
-        // Phase 2: Order processing steps
-        validation: firstResult.performance.validation,
-        qrGeneration: firstResult.performance.qrGeneration,
-        userAssignment: firstResult.performance.userAssignment,
-        transactionCreation: firstResult.performance.transactionCreation,
-        balanceUpdate: firstResult.performance.balanceUpdate,
-        
-        // Phase 3: Order processing total
-        orderProcessing: orderProcessingTime,
-        
-        // Total time
-        total: Math.round(totalTime)
-      };
-    }
-
-    // Add aggregated performance for bulk orders
-    if (ordersArray.length > 1) {
-      const allPerformances = processingResults
-        .filter(r => r.performance)
-        .map(r => r.performance!);
-      
-      if (allPerformances.length > 0) {
-        const avgPerf = {
-          validation: Math.round(allPerformances.reduce((sum, p) => sum + p.validation, 0) / allPerformances.length),
-          qrGeneration: Math.round(allPerformances.reduce((sum, p) => sum + p.qrGeneration, 0) / allPerformances.length),
-          userAssignment: Math.round(allPerformances.reduce((sum, p) => sum + p.userAssignment, 0) / allPerformances.length),
-          transactionCreation: Math.round(allPerformances.reduce((sum, p) => sum + p.transactionCreation, 0) / allPerformances.length),
-          balanceUpdate: Math.round(allPerformances.reduce((sum, p) => sum + p.balanceUpdate, 0) / allPerformances.length),
-          orderProcessing: Math.round(allPerformances.reduce((sum, p) => sum + p.total, 0) / allPerformances.length)
-        };
-        
-        const maxPerf = {
-          validation: Math.max(...allPerformances.map(p => p.validation)),
-          qrGeneration: Math.max(...allPerformances.map(p => p.qrGeneration)),
-          userAssignment: Math.max(...allPerformances.map(p => p.userAssignment)),
-          transactionCreation: Math.max(...allPerformances.map(p => p.transactionCreation)),
-          balanceUpdate: Math.max(...allPerformances.map(p => p.balanceUpdate)),
-          orderProcessing: Math.max(...allPerformances.map(p => p.total))
-        };
-        
-        // Calculate bulk overhead
-        const totalOrderProcessing = allPerformances.reduce((sum, p) => sum + p.total, 0);
-        const bulkOverhead = Math.max(0, Math.round(totalTime - totalOrderProcessing));
-        
-        logData.performance = {
-          requestOverhead: bulkOverhead,
-          average: avgPerf,
-          slowest: maxPerf,
-          avgPerOrder: Math.round(totalTime / ordersArray.length),
-          ordersPerSecond: Math.round((ordersArray.length / (totalTime / 1000)) * 100) / 100,
-          total: Math.round(totalTime)
-        };
-      }
+      logData.performance = firstResult.performance;
     }
 
     // Log once with all details (success or failure)
@@ -1045,30 +951,19 @@ export async function POST(
         ? `All ${processingResults.length} orders created successfully`
         : `${successCount} of ${processingResults.length} orders created successfully, ${failureCount} failed`;
       
-      // Simplify results to match original single order format
-      const simplifiedResults = processingResults.map(result => {
-        if (result.success) {
-          return {
-            success: true,
-            message: result.message,
-            data: result.data
-          };
-        } else {
-          return {
-            success: false,
-            message: result.message,
-            merchantOrdId: result.merchantOrdId
-          };
-        }
-      });
-      
       return NextResponse.json({
         success: overallSuccess,
         message: message,
-        total: processingResults.length,
-        successful: successCount,
-        failed: failureCount,
-        results: simplifiedResults
+        summary: {
+          totalOrders: processingResults.length,
+          successCount,
+          failureCount,
+          depositCount,
+          withdrawCount,
+          processingTime: Math.round(totalTime),
+          strategy: processingStrategy
+        },
+        results: processingResults
       });
     }
 
@@ -1139,8 +1034,7 @@ async function processSingleOrderOptimized(
   orderData: CreateOrderData,
   merchantAccount: MerchantAccount,
   clientIp: string,
-  request: NextRequest,
-  healthyDatabase: 'appwrite' | 'supabase' | 'none'
+  request: NextRequest
 ): Promise<ProcessingResult[]> {
   const data = orderData as CreateOrderData;
   
@@ -1176,26 +1070,31 @@ async function processSingleOrderOptimized(
     // Store the bank receive name from validation for withdraw orders
     const bankReceiveName: string | undefined = basicValidation.bankReceiveName;
 
-    // Generate a unique order ID if not provided (using dynamic prefix based on database)
-    const odrId = data.odrId || generateOrderId(healthyDatabase);
+    // Generate a unique order ID if not provided  
+    const odrId = data.odrId || generateOrderId();
 
     // STEP 2: QR Code Generation (deposit/withdraw)
     const qrStart = performance.now();
     let qrCode: string | undefined = undefined;
     let bank;
 
-    // OPTIMIZATION: Generate QR based on type - use local mode only (no URL fallback)
+    // Generate QR based on type and configuration
     if (data.odrType === 'deposit' && data.bankId) {
       try {
         const bankResult = await getBankById(data.bankId);
         if (!bankResult.success || !bankResult.bank) {
-          // Automatic fallback: Use fallback bank data when lookup fails
-          console.warn(`Bank lookup failed: Using fallback bank data for bankId: ${data.bankId}`);
-          bank = {
-            $id: data.bankId,
-            ...appConfig.fallbackBankData,
-            bankId: data.bankId  // Override with actual bankId from request
-          };
+          // If client-only mode is enabled, use fallback bank data
+          if (appConfig.useClientOnlyPayment) {
+            console.warn(`Bank lookup failed (client-only mode): Using fallback bank data for bankId: ${data.bankId}`);
+            // Use fallback bank data from config
+            bank = {
+              $id: data.bankId,
+              ...appConfig.fallbackBankData,
+              bankId: data.bankId  // Override with actual bankId from request
+            };
+          } else {
+            throw new Error('Transactor bank not found');
+          }
         } else {
           bank = bankResult.bank;
         }
@@ -1203,38 +1102,86 @@ async function processSingleOrderOptimized(
         console.error("Error fetching bank data:", {
           error,
           errorMessage: error instanceof Error ? error.message : 'Unknown error',
+          clientOnlyMode: appConfig.useClientOnlyPayment,
           bankId: data.bankId
         });
         
-        // Automatic fallback: Use fallback bank data on database error
-        console.warn(`Database error: Using fallback bank data for bankId: ${data.bankId}`);
-        bank = {
-          $id: data.bankId,
-          ...appConfig.fallbackBankData,
-          bankId: data.bankId  // Override with actual bankId from request
-        };
+        // If client-only mode is enabled and this is a database error, use fallback bank data
+        if (appConfig.useClientOnlyPayment) {
+          console.warn(`Database error (client-only mode): Using fallback bank data for bankId: ${data.bankId}`);
+          // Use fallback bank data from config
+          bank = {
+            $id: data.bankId,
+            ...appConfig.fallbackBankData,
+            bankId: data.bankId  // Override with actual bankId from request
+          };
+        } else {
+          throw error;
+        }
       }
       
-      // OPTIMIZATION: Use QR Local directly (no try-catch overhead, no URL fallback)
-      const qrResult = await QRLocal.generateQR({
-        bankBin: bank.bankBinCode,
-        accountNumber: bank.accountNumber,
-        amount: Number(data.amount),
-        orderId: odrId
-      });
-      
-      qrCode = qrResult.qrDataURL || undefined;
+      if (appConfig.create_qr_by === 'local') {
+        // Use QR Local for deposit
+        try {
+          const qrResult = await QRLocal.generateQR({
+            bankBin: bank.bankBinCode,
+            accountNumber: bank.accountNumber,
+            amount: Number(data.amount),
+            orderId: odrId
+          });
+          
+          if (qrResult.success && qrResult.qrDataURL) {
+            qrCode = qrResult.qrDataURL;
+          } else {
+            qrCode = `https://img.vietqr.io/image/${bank.bankBinCode}-${bank.accountNumber}-${qrTemplateCode}.png?amount=${Math.floor(Number(data.amount))}&addInfo=${odrId}`;
+          }
+        } catch {
+          qrCode = `https://img.vietqr.io/image/${bank.bankBinCode}-${bank.accountNumber}-${qrTemplateCode}.png?amount=${Math.floor(Number(data.amount))}&addInfo=${odrId}`;
+        }
+      } else if (appConfig.create_qr_by === 'vietqr') {
+        // Use VietQR API for deposit
+        try {
+          const qrResult = await VietQRService.generateQRCode({
+            bankCode: bank.bankBinCode,
+            accountNumber: bank.accountNumber,
+            accountName: bank.ownerName,
+            amount: Number(data.amount),
+            orderId: odrId
+          });
+          
+          if (qrResult.success) {
+            qrCode = qrResult.qrCode;
+          } else {
+            qrCode = `https://img.vietqr.io/image/${bank.bankBinCode}-${bank.accountNumber}-${qrTemplateCode}.png?amount=${Math.floor(Number(data.amount))}&addInfo=${odrId}`;
+          }
+        } catch {
+          qrCode = `https://img.vietqr.io/image/${bank.bankBinCode}-${bank.accountNumber}-${qrTemplateCode}.png?amount=${Math.floor(Number(data.amount))}&addInfo=${odrId}`;
+        }
+      }
     }
     else if (data.odrType === 'withdraw' && data.bankReceiveNumber && data.bankCode) {
-      // OPTIMIZATION: Use QR Local directly for withdraw (no try-catch overhead, no URL fallback)
-      const qrResult = await QRLocal.generateQR({
-        bankBin: data.bankCode,
-        accountNumber: data.bankReceiveNumber,
-        amount: Number(data.amount),
-        orderId: odrId
-      });
-      
-      qrCode = qrResult.qrDataURL || undefined;
+      if (appConfig.create_qr_by === 'local') {
+        // Use QR Local for withdraw
+        try {
+          const qrResult = await QRLocal.generateQR({
+            bankBin: data.bankCode,
+            accountNumber: data.bankReceiveNumber,
+            amount: Number(data.amount),
+            orderId: odrId
+          });
+          
+          if (qrResult.success && qrResult.qrDataURL) {
+            qrCode = qrResult.qrDataURL;
+          } else {
+            qrCode = `https://img.vietqr.io/image/${data.bankCode}-${data.bankReceiveNumber}-${qrTemplateCode}.png?amount=${Math.floor(Number(data.amount))}&addInfo=${odrId}`;
+          }
+        } catch {
+          qrCode = `https://img.vietqr.io/image/${data.bankCode}-${data.bankReceiveNumber}-${qrTemplateCode}.png?amount=${Math.floor(Number(data.amount))}&addInfo=${odrId}`;
+        }
+      } else {
+        // Use VietQR direct URL for withdraw (default for vietqr mode)
+        qrCode = `https://img.vietqr.io/image/${data.bankCode}-${data.bankReceiveNumber}-${qrTemplateCode}.png?amount=${Math.floor(Number(data.amount))}&addInfo=${odrId}`;
+      }
     }
     
     performanceMetrics.qrGeneration = performance.now() - qrStart;
@@ -1306,114 +1253,60 @@ async function processSingleOrderOptimized(
     // STEP 4: Transaction Creation
     const transactionStart = performance.now();
     
-    // Choose database based on health check (Appwrite priority, Supabase fallback)
+    // Choose database based on useClientOnlyPayment config
     let transactionResult;
     let createdOrder;
     
-    if (healthyDatabase === 'appwrite') {
-      // Priority 1: Write to Appwrite
-      try {
-        transactionResult = await createTransactionOptimized(transactionData);
+    if (appConfig.useClientOnlyPayment) {
+      // Write to Supabase backup database
+      const backupService = new BackupOrderService();
+      const supabaseResult = await backupService.createBackupOrder({
+        odr_id: odrId,
+        merchant_odr_id: data.merchantOrdId || '',
+        odr_type: data.odrType,
+        odr_status: data.odrType === 'deposit' ? 'processing' : 'pending',
+        amount: Math.floor(Number(data.amount)),
+        paid_amount: 0,
+        unpaid_amount: Math.floor(Number(data.amount)),
+        merchant_id: merchantAccount.publicTransactionId,
+        merchant_account_id: merchantAccount.$id,
         
-        if (!transactionResult || !transactionResult.success || !transactionResult.data) {
-          throw new Error(transactionResult?.message || 'Transaction creation failed');
-        }
+        // Deposit fields
+        bank_id: data.bankId,
+        bank_name: bank?.bankName,
+        bank_bin_code: bank?.bankBinCode,
+        account_number: bank?.accountNumber,
+        account_name: bank?.ownerName,
+        qr_code: qrCode,
         
-        createdOrder = transactionResult.data;
-      } catch (error) {
-        console.error('Appwrite transaction creation failed:', error);
-        throw new Error(`Failed to create transaction in Appwrite: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    } else if (healthyDatabase === 'supabase') {
-      // Fallback: Write to Supabase backup database
-      try {
-        const backupService = new BackupOrderService();
-        const supabaseResult = await backupService.createBackupOrder({
-          odr_id: odrId,
-          merchant_odr_id: data.merchantOrdId || '',
-          odr_type: data.odrType,
-          odr_status: data.odrType === 'deposit' ? 'processing' : 'pending',
-          amount: Math.floor(Number(data.amount)),
-          paid_amount: 0,
-          unpaid_amount: Math.floor(Number(data.amount)),
-          merchant_id: merchantAccount.publicTransactionId,
-          merchant_account_id: merchantAccount.$id,
-          
-          // Deposit fields
-          bank_id: data.bankId,
-          bank_name: bank?.bankName,
-          bank_bin_code: bank?.bankBinCode,
-          account_number: bank?.accountNumber,
-          account_name: bank?.ownerName,
-          qr_code: qrCode,
-          
-          // Withdraw fields
-          bank_code: data.bankCode,
-          bank_receive_number: data.bankReceiveNumber,
-          bank_receive_owner_name: data.bankReceiveOwnerName,
-          bank_receive_name: bankReceiveName,
-          
-          // URLs
-          url_success: data.urlSuccess || '',
-          url_failed: data.urlFailed || '',
-          url_canceled: data.urlCanceled || '',
-          url_callback: data.urlCallBack || '',
-          
-          created_ip: clientIp,
-          is_suspicious: isSuspicious,
-          last_payment_date: new Date().toISOString()
-        });
+        // Withdraw fields
+        bank_code: data.bankCode,
+        bank_receive_number: data.bankReceiveNumber,
+        bank_receive_owner_name: data.bankReceiveOwnerName,
+        bank_receive_name: bankReceiveName,
         
-        if (!supabaseResult.success) {
-          throw new Error(supabaseResult.error || 'Failed to create order in Supabase');
-        }
+        // URLs
+        url_success: data.urlSuccess || '',
+        url_failed: data.urlFailed || '',
+        url_canceled: data.urlCanceled || '',
+        url_callback: data.urlCallBack || '',
         
-        // Create a mock order object matching Appwrite structure for compatibility
-        createdOrder = {
-          $id: supabaseResult.orderId || odrId,
-          odrId: odrId,
-          merchantOrdId: data.merchantOrdId || '',
-          odrType: data.odrType,
-          odrStatus: data.odrType === 'deposit' ? 'processing' : 'pending',
-          amount: Math.floor(Number(data.amount)),
-          paidAmount: 0,
-          unPaidAmount: Math.floor(Number(data.amount)),
-          bankId: data.bankId || '',
-          qrCode: qrCode,
-          bankCode: data.bankCode,
-          bankReceiveNumber: data.bankReceiveNumber,
-          bankReceiveOwnerName: data.bankReceiveOwnerName,
-          bankReceiveName: bankReceiveName,
-          urlSuccess: data.urlSuccess,
-          urlFailed: data.urlFailed,
-          urlCanceled: data.urlCanceled,
-          urlCallBack: data.urlCallBack,
-          $createdAt: new Date().toISOString()
-        };
-        
-        transactionResult = { success: true, data: createdOrder };
-      } catch (error) {
-        console.error('Supabase transaction creation failed:', error);
-        throw new Error(`Failed to create transaction in Supabase: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    } else {
-      // Fallback mode or both databases unhealthy
-      const { getCoreRunningMode } = await import('@/lib/appconfig');
-      const runningMode = getCoreRunningMode();
-      const isFallbackMode = runningMode === 'fallback';
+        created_ip: clientIp,
+        is_suspicious: isSuspicious,
+        last_payment_date: new Date().toISOString()
+      });
       
-      // IMPORTANT: Fallback mode only supports deposits (withdrawals require balance tracking)
-      if (data.odrType === 'withdraw') {
-        throw new Error('Fallback mode only supports deposit orders. Withdrawals require database for balance tracking.');
+      if (!supabaseResult.success) {
+        throw new Error(supabaseResult.error || 'Failed to create order in Supabase');
       }
       
-      // Create a temporary order object for payment URL generation (no database write)
+      // Create a mock order object matching Appwrite structure for compatibility
       createdOrder = {
-        $id: odrId,
+        $id: supabaseResult.orderId || odrId,
         odrId: odrId,
         merchantOrdId: data.merchantOrdId || '',
         odrType: data.odrType,
-        odrStatus: 'processing', // Always processing for deposits in fallback mode
+        odrStatus: data.odrType === 'deposit' ? 'processing' : 'pending',
         amount: Math.floor(Number(data.amount)),
         paidAmount: 0,
         unPaidAmount: Math.floor(Number(data.amount)),
@@ -1423,55 +1316,25 @@ async function processSingleOrderOptimized(
         bankReceiveNumber: data.bankReceiveNumber,
         bankReceiveOwnerName: data.bankReceiveOwnerName,
         bankReceiveName: bankReceiveName,
-        urlSuccess: data.urlSuccess,
-        urlFailed: data.urlFailed,
-        urlCanceled: data.urlCanceled,
-        urlCallBack: data.urlCallBack,
         $createdAt: new Date().toISOString()
       };
       
       transactionResult = { success: true, data: createdOrder };
+    } else {
+      // Normal mode: Write to Appwrite
+      transactionResult = await createTransactionOptimized(transactionData);
       
-      if (isFallbackMode) {
-        console.log('🟡 [Fallback Mode] Order created without database - payment URL generated with encrypted data');
-      } else {
-        console.warn('⚠️ [Resilient Mode] Both databases unhealthy - order not saved but payment URL generated');
+      if (!transactionResult || !transactionResult.success || !transactionResult.data) {
+        throw new Error(transactionResult?.message || 'Transaction creation failed');
       }
+      
+      createdOrder = transactionResult.data;
     }
     
     performanceMetrics.transactionCreation = performance.now() - transactionStart;
     
     if (!transactionResult || !transactionResult.success || !createdOrder) {
       throw new Error('Transaction creation failed');
-    }
-
-    // OPTIMIZATION: Cache webhook data ONLY in fallback mode (when databases are down)
-    // This allows merchant webhooks to be sent even when databases are unavailable
-    // In normal mode (appwrite/supabase), webhook data is already in database
-    if (healthyDatabase === 'none' && createdOrder.urlCallBack) {
-      try {
-        const { cacheFallbackWebhookData } = await import('@/lib/cache/webhook-fallback-cache');
-        const apiKeyFromRequest = request.headers.get('x-api-key') || '';
-        
-        await cacheFallbackWebhookData({
-          odrId: createdOrder.odrId,
-          merchantOrdId: createdOrder.merchantOrdId || '',
-          orderType: createdOrder.odrType,
-          urlCallback: createdOrder.urlCallBack,
-          apiKey: apiKeyFromRequest, // API key from request headers
-          bankReceiveNumber: createdOrder.bankReceiveNumber,
-          bankReceiveOwnerName: createdOrder.bankReceiveOwnerName,
-          accountName: createdOrder.bankReceiveName, // Bank name from order
-          accountNumber: data.odrType === 'deposit' ? (createdOrder.bankReceiveNumber || '') : '',
-          merchantId: merchantAccount.publicTransactionId,
-          cachedAt: Date.now()
-        });
-        
-        console.log('✅ [Fallback Mode] Cached webhook data (L1+L2) for order:', createdOrder.odrId);
-      } catch (error) {
-        // Cache failure shouldn't block order creation
-        console.error('⚠️ [Fallback Mode] Failed to cache webhook data:', error);
-      }
     }
 
     const formattedTimestamp = formatTimestamp(createdOrder.$createdAt);
@@ -1557,54 +1420,47 @@ async function processSingleOrderOptimized(
     
     // Return formatted result with performance data
     if (data.odrType === 'deposit') {
-      const baseUrl = getPaymentBaseUrl();
+      const baseUrl = getPaymentBaseUrl(request);
+      let paymentUrl = `${baseUrl}/payment/${createdOrder.odrId}`;
       
-      // ALWAYS use payment-direct with encoded URL (client-only, no database queries, faster)
-      let paymentUrl: string;
-      
-      try {
-        // Get merchant account info for logo and name (with fallback)
-        let merchantInfo;
+      // If client-only payment mode is enabled, create encoded payment URL
+      if (appConfig.useClientOnlyPayment) {
         try {
-          merchantInfo = await getAccount(merchantAccount.publicTransactionId);
-        } catch {
-          // If account fetch fails, use basic info
-          merchantInfo = { accountName: '' };
+          // Get merchant account info for logo and name
+          const merchantInfo = await getAccount(merchantAccount.publicTransactionId);
+          
+          const paymentData: PaymentData = {
+            odrId: createdOrder.odrId,
+            merchantOrdId: createdOrder.merchantOrdId,
+            odrType: createdOrder.odrType,
+            odrStatus: createdOrder.odrStatus,
+            amount: createdOrder.amount,
+            timestamp: createdOrder.$createdAt,
+            bankName: bank!.bankName,
+            bankBinCode: bank!.bankBinCode,
+            accountNumber: bank!.accountNumber,
+            accountName: bank!.ownerName,
+            // OPTIMIZATION: Don't include large data in URL to prevent 431 errors
+            qrCode: null, // QR will be generated client-side from bank info
+            urlSuccess: createdOrder.urlSuccess,
+            urlFailed: createdOrder.urlFailed,
+            urlCanceled: createdOrder.urlCanceled,
+            urlCallBack: createdOrder.urlCallBack,
+            merchantName: merchantInfo?.accountName || '',
+            // OPTIMIZATION: Don't include logo URL - use default icon instead
+            merchantLogoUrl: '',
+            merchantId: merchantAccount.publicTransactionId
+          };
+          
+          paymentUrl = createEncodedPaymentUrl(baseUrl, paymentData);
+        } catch (error) {
+          // If encoding fails, fallback to regular URL
+          console.error('Failed to create encoded payment URL:', error);
+          await log.error('Failed to create encoded payment URL', error instanceof Error ? error : new Error(String(error)), {
+            orderId: createdOrder.odrId,
+            merchantId: merchantAccount.publicTransactionId
+          });
         }
-        
-        const paymentData: PaymentData = {
-          odrId: createdOrder.odrId,
-          merchantOrdId: createdOrder.merchantOrdId,
-          odrType: createdOrder.odrType,
-          odrStatus: createdOrder.odrStatus,
-          amount: createdOrder.amount,
-          timestamp: createdOrder.$createdAt, // This is the createdAt for expiration check
-          bankName: bank!.bankName,
-          bankBinCode: bank!.bankBinCode,
-          accountNumber: bank!.accountNumber,
-          accountName: bank!.ownerName,
-          // OPTIMIZATION: Don't include large data in URL to prevent 431 errors
-          qrCode: null, // QR will be generated client-side from bank info
-          urlSuccess: createdOrder.urlSuccess,
-          urlFailed: createdOrder.urlFailed,
-          urlCanceled: createdOrder.urlCanceled,
-          urlCallBack: createdOrder.urlCallBack,
-          merchantName: merchantInfo?.accountName || '',
-          // OPTIMIZATION: Don't include logo URL - use default icon instead
-          merchantLogoUrl: '',
-          merchantId: merchantAccount.publicTransactionId
-        };
-        
-        paymentUrl = createEncodedPaymentUrl(baseUrl, paymentData);
-      } catch (error) {
-        // If encoding fails, log error and use fallback regular URL
-        console.error('Failed to create encoded payment URL, using regular URL:', error);
-        await log.warn('Failed to create encoded payment URL, falling back to regular URL', {
-          orderId: createdOrder.odrId,
-          merchantId: merchantAccount.publicTransactionId,
-          error: error instanceof Error ? error.message : String(error)
-        });
-        paymentUrl = `${baseUrl}/payment/${createdOrder.odrId}`;
       }
 
       return [{
@@ -1655,6 +1511,7 @@ async function processSingleOrderOptimized(
         data: {
           odrId: createdOrder.odrId,
           odrStatus: createdOrder.odrStatus,
+          bankReceiveCode: createdOrder.bankReceiveCode,
           bankReceiveNumber: createdOrder.bankReceiveNumber,
           bankReceiveOwnerName: createdOrder.bankReceiveOwnerName,
           amount: createdOrder.amount,
@@ -1687,12 +1544,11 @@ async function processOrdersParallel(
   ordersArray: CreateOrderData[],
   merchantAccount: MerchantAccount,
   clientIp: string,
-  request: NextRequest,
-  healthyDatabase: 'appwrite' | 'supabase' | 'none'
+  request: NextRequest
 ): Promise<ProcessingResult[]> {
   // Process all orders simultaneously
   const promises = ordersArray.map((orderData) =>
-    processSingleOrderOptimized(orderData, merchantAccount, clientIp, request, healthyDatabase)
+    processSingleOrderOptimized(orderData, merchantAccount, clientIp, request)
       .then(result => result[0]) // Extract single result from array
       .catch(error => ({
         success: false,
@@ -1712,8 +1568,7 @@ async function processOrdersBatched(
   merchantAccount: MerchantAccount,
   clientIp: string,
   request: NextRequest,
-  batchSize: number = 10,
-  healthyDatabase: 'appwrite' | 'supabase' | 'none'
+  batchSize: number = 10
 ): Promise<ProcessingResult[]> {
   const results: ProcessingResult[] = [];
   
@@ -1721,7 +1576,7 @@ async function processOrdersBatched(
     const batch = ordersArray.slice(i, i + batchSize);
     
     const batchPromises = batch.map((orderData) =>
-      processSingleOrderOptimized(orderData, merchantAccount, clientIp, request, healthyDatabase)
+      processSingleOrderOptimized(orderData, merchantAccount, clientIp, request)
         .then(result => result[0]) // Extract single result from array
         .catch(error => ({
           success: false,

@@ -68,7 +68,8 @@ export const publicPaths = [
   '/payment-direct/',
   '/webhook',
   '/public',
-  '/transbot'
+  '/transbot',
+  '/darkveil' // Allow all /darkveil/* paths (secret path validated in page component)
 ] as const
 
 export const internalApiPaths = [

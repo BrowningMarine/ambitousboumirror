@@ -1,0 +1,138 @@
+{
+  "_metadata": {
+    "version": "2.0.0",
+    "lastModified": "2025-11-07T07:33:48.810Z",
+    "description": "Application configuration - controls core system behavior. Most settings here, secrets in .env",
+    "requiresRestart": {
+      "paymentEncryptionKey": true,
+      "qrClientId": true,
+      "qrClientSecret": true,
+      "siteUrl": false,
+      "trustedDomains": true,
+      "configSecretPath": true,
+      "baseSettings": false,
+      "merchants": false,
+      "banks": false
+    }
+  },
+  "baseSettings": {
+    "title": "Ambitousboy",
+    "description": "API transactions management system",
+    "icon": "/icons/logonew.svg",
+    "siteUrl": "https://dev.thedreamforlife.online",
+    "paymentBaseUrl": "https://dev.thedreamforlife.online",
+    "cookieName": "ambitousboy-session",
+    "locales": [
+      "en",
+      "zh",
+      "vn"
+    ],
+    "defaultLocale": "en",
+    "odrPrefix": "ABO",
+    "paymentWindowSeconds": 900,
+    "withdrawExportPassword": "FOux9fCv91mQaBx",
+    "qrTemplateCode": "VE7bsvs",
+    "createQrBy": "local",
+    "allowRegister": true,
+    "trustedDomains": [
+      "https://vietnam.infantry5.com",
+      "https://thedreamforlife.online",
+      "https://esomarvnm.com",
+      "https://www.esomarvnm.com",
+      "https://esomarvietnam.com",
+      "https://www.esomarvietnam.com"
+    ],
+    "allowAllFrameEmbedding": false
+  },
+  "security": {
+    "paymentEncryptionKey": "rHvgV8Y5tLcu21x0Pdv59bDg",
+    "adminPassword": "$2b$10$example.hash.change.in.production",
+    "adminPasswordPlaintext": "DarkVeilismymaster0908!",
+    "configSecretPath": "maisupositrit"
+  },
+  "qrService": {
+    "clientUrl": "https://api.vietqr.io/v2/generate",
+    "clientId": "f928265a-985e-4a86-a312-d80975b22b79",
+    "clientSecret": "12e367e4-a0a9-4488-8183-06976e00c8cf"
+  },
+  "fallbackBank": {
+    "bankId": "default-bank",
+    "bankName": "Default Bank",
+    "bankBinCode": "970422",
+    "accountNumber": "0000000000",
+    "ownerName": "Default Account",
+    "isActivated": true,
+    "minAmount": 50000,
+    "maxAmount": 500000000,
+    "availableBalance": 49454429238
+  },
+  "merchants": {
+    "ESOMAR": {
+      "apiKeyHash": "ea848cdf856564ed1f570cad08e0536364d3fc655074867c4c4af8b44a7d69c0",
+      "accountId": "VMJvxjsNuc",
+      "minDepositAmount": 500000,
+      "maxDepositAmount": 0,
+      "minWithdrawAmount": 50000,
+      "maxWithdrawAmount": 500000000,
+      "depositWhitelistIps": [
+        "144.48.228.205",
+        "47.84.57.210",
+        "122.248.253.216",
+        "47.84.72.153"
+      ],
+      "withdrawWhitelistIps": [
+        "144.48.228.205",
+        "47.84.57.210",
+        "122.248.253.216",
+        "47.84.72.153"
+      ],
+      "enabled": true
+    }
+  },
+  "banks": {
+    "EsomarDeptACB": {
+      "bankId": "ETBJ08yEzt",
+      "bankName": "ACB bank - Ngan hang TMCP A Chau",
+      "bankBinCode": "970416",
+      "accountNumber": "991156",
+      "ownerName": "CTY ESOMARVN",
+      "minAmount": 50000,
+      "maxAmount": 500000000,
+      "isActivated": true,
+      "priority": 1
+    }
+  },
+  "_instructions": {
+    "purpose": "Centralized configuration for the entire application",
+    "merchants": "Fallback merchant validation when databases are down",
+    "banks": "Fallback bank data when databases are down",
+    "security": "Encryption keys and passwords - keep this file secure!",
+    "requiresRestart": "Check _metadata.requiresRestart to see which changes need server restart"
+  },
+  "databaseSettings": {
+    "supabaseOrderPrefix": "EMO",
+    "coreRunningMode": "appwrite",
+    "availableModes": [
+      "auto",
+      "appwrite",
+      "supabase",
+      "fallback"
+    ],
+    "modeDescriptions": {
+      "auto": "Automatic failover: Appwrite -> Supabase -> fallback - base on piority settings",
+      "appwrite": "Use Appwrite database only",
+      "supabase": "Use Supabase database only",
+      "fallback": "No database writes - uses config fallback bank/merchant, validates by timestamp"
+    },
+    "fallbackOrderPrefix": "FBO",
+    "databasePriority": [
+      "appwrite",
+      "supabase",
+      "fallback"
+    ]
+  },
+  "webhookSettings": {
+    "enableCallbackBatching": true,
+    "description": "When true: batch multiple orders with same callback URL into one array request. When false: send separate parallel requests (legacy behavior)"
+  }
+}

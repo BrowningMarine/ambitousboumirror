@@ -32,7 +32,7 @@ import {
 } from '@/lib/actions/bankTransacionEntry.action';
 import { createAdminClient } from '@/lib/appwrite/appwrite.actions';
 import { appwriteConfig } from '@/lib/appwrite/appwrite-config';
-import { ID } from 'appwrite';
+import { ID, Query } from 'appwrite';
 import { log } from '@/lib/logger';
 
 // Security check
@@ -577,20 +577,79 @@ async function syncOrders(
 
     await log.info('Building account cache', { merchantCount: merchantIds.length });
 
+    // DEBUG: Log all merchant IDs we're looking for
+    await log.info('Merchant IDs to lookup', { 
+      merchantIds,
+      sampleMerchantId: merchantIds[0],
+      totalCount: merchantIds.length
+    });
+
+    // DEBUG: List a few accounts to see actual structure
+    try {
+      const sampleAccounts = await database.listDocuments(
+        appwriteConfig.databaseId,
+        appwriteConfig.accountsCollectionId
+      );
+      
+      await log.info('Sample accounts in database', {
+        total: sampleAccounts.total,
+        samples: sampleAccounts.documents.slice(0, 5).map(doc => ({
+          docId: doc.$id,
+          accountId: doc.accountId,
+          publicTransactionId: doc.publicTransactionId,
+          accountName: doc.accountName
+        }))
+      });
+    } catch (error) {
+      await log.error('Failed to list sample accounts', error instanceof Error ? error : new Error(String(error)));
+    }
+
     // Fetch all merchant accounts in parallel (batch of 10)
+    // Note: merchant_id in Supabase = publicTransactionId in Appwrite
     const BATCH_SIZE = 10;
     for (let i = 0; i < merchantIds.length; i += BATCH_SIZE) {
       const batch = merchantIds.slice(i, i + BATCH_SIZE);
       await Promise.all(
         batch.map(async (merchantId) => {
           try {
-            const accounts = await database.listDocuments(
-              appwriteConfig.databaseId,
-              appwriteConfig.accountsCollectionId,
-              [`equal("accountId", "${merchantId}")`]
-            );
-            if (accounts.documents.length > 0) {
-              accountCache.set(merchantId, accounts.documents[0].$id);
+            // Search using Query helper for correct Appwrite syntax
+            const [byPublicId, byAccountId] = await Promise.all([
+              database.listDocuments(
+                appwriteConfig.databaseId,
+                appwriteConfig.accountsCollectionId,
+                [Query.equal('publicTransactionId', merchantId)]
+              ),
+              database.listDocuments(
+                appwriteConfig.databaseId,
+                appwriteConfig.accountsCollectionId,
+                [Query.equal('accountId', merchantId)]
+              )
+            ]);
+
+            await log.info('Account search results', {
+              merchantId,
+              byPublicId: byPublicId.documents.length,
+              byAccountId: byAccountId.documents.length,
+              publicIdResult: byPublicId.documents.length > 0 ? {
+                docId: byPublicId.documents[0].$id,
+                accountId: byPublicId.documents[0].accountId,
+                publicTransactionId: byPublicId.documents[0].publicTransactionId
+              } : null
+            });
+
+            if (byPublicId.documents.length > 0) {
+              accountCache.set(merchantId, byPublicId.documents[0].$id);
+            } else if (byAccountId.documents.length > 0) {
+              accountCache.set(merchantId, byAccountId.documents[0].$id);
+              await log.warn('Found by accountId instead of publicTransactionId', {
+                merchantId,
+                docId: byAccountId.documents[0].$id
+              });
+            } else {
+              await log.warn('Account not found for merchant', {
+                merchantId,
+                searchField: 'publicTransactionId or accountId'
+              });
             }
           } catch (error) {
             await log.error('Failed to fetch account', error instanceof Error ? error : new Error(String(error)), {
@@ -601,7 +660,7 @@ async function syncOrders(
       );
     }
 
-    await log.info('Account cache built', { cached: accountCache.size });
+    await log.info('Account cache built', { cached: accountCache.size, expected: merchantIds.length });
 
     // Process orders in batches of 5 (parallel processing)
     const PROCESS_BATCH_SIZE = 5;

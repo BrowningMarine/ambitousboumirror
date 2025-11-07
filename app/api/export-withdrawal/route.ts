@@ -157,7 +157,8 @@ async function getOptimizedWithdrawalTransactions(
   userRole: string,
   filters: Record<string, unknown>,
   offset: number = 0,
-  limit: number = 100
+  limit: number = 100,
+  countOnly: boolean = false  // New parameter to differentiate count vs export queries
 ) {
   // Use cached account data to avoid repeated queries
   const accounts = await DatabaseOptimizer.getCachedUserData(
@@ -200,20 +201,25 @@ async function getOptimizedWithdrawalTransactions(
     queries.push(Query.lessThanEqual("$createdAt", endDate.toISOString()));
   }
 
-  // Add ordering and pagination
+  // Add ordering
   queries.push(Query.orderDesc("$createdAt"));
   
-  if (limit > 0) {
+  // For count queries, use a small limit just to get total count
+  // For export queries, use the actual requested limit
+  if (countOnly) {
+    queries.push(Query.limit(1)); // Only need 1 result to get total
+  } else if (limit > 0) {
     queries.push(Query.limit(limit));
     queries.push(Query.offset(offset));
   }
 
-  // Use optimized query execution with read replica and caching
+  // Use optimized query execution with read replica
+  // IMPORTANT: Disable caching for export queries to avoid returning cached count results
   return await DatabaseQueryOptimizer.executeOptimizedQuery(
     ODRTRANS_COLLECTION_ID!,
     queries,
     {
-      useCache: limit <= 100, // Cache smaller queries
+      useCache: countOnly && limit <= 100, // Only cache count queries
       cacheTTL: 30 * 1000, // 30 seconds cache
       useReadReplica: true, // Use read replica to avoid blocking writes
       batchSize: limit
@@ -311,8 +317,9 @@ export async function POST(req: NextRequest) {
             user.$id,
             userRole,
             filters,
-            0, // offset
-            1   // small limit for count
+            0,    // offset
+            1,    // limit (not used for count, but required parameter)
+            true  // countOnly flag - this will use Query.limit(1) but return accurate total
           );
           return result.total || 0;
         },
@@ -377,7 +384,8 @@ export async function POST(req: NextRequest) {
         userRole,
         filters,
         batchOffset,
-        batchSize
+        batchSize,
+        false  // countOnly = false - we need full data for export, not just count
       );
 
       if (!result || !result.documents || result.documents.length === 0) {

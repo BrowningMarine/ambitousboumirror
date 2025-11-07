@@ -8,10 +8,22 @@ const withNextIntlConfig = withNextIntl('./i18n.config.ts');
  * @type {import('next').NextConfig}  
  */
 const config: NextConfig = {
-  webpack(config) {
+  webpack(config, { isServer }) {
     config.cache = {
       type: 'memory',
     };
+    
+    // Exclude Node.js modules from client bundle
+    if (!isServer) {
+      config.resolve = config.resolve || {};
+      config.resolve.fallback = {
+        ...config.resolve.fallback,
+        fs: false,
+        path: false,
+        crypto: false,
+      };
+    }
+    
     return config;
   },
   // Images configuration for external domains

@@ -11,7 +11,10 @@ import {
 } from "@/lib/utils";
 import type { PaymentData } from "@/lib/payment-encoder";
 import { generateClientQR } from "@/lib/client-qr-generator";
-import { subscribeToOrderChanges, fetchOrderStatus } from "@/lib/supabase-client";
+import {
+  subscribeToOrderChanges,
+  fetchOrderStatus,
+} from "@/lib/client/supabase-client";
 import { BackupOrder } from "@/lib/supabase-backup";
 
 // Define TypeScript interfaces
@@ -42,7 +45,7 @@ function downloadQRCode(qrCodeData: string, orderId: string): void {
   try {
     if (isBase64Image(qrCodeData)) {
       // For base64 data, create a download link
-      const link = document.createElement('a');
+      const link = document.createElement("a");
       link.href = qrCodeData;
       link.download = `QR_${orderId}.png`;
       document.body.appendChild(link);
@@ -51,10 +54,10 @@ function downloadQRCode(qrCodeData: string, orderId: string): void {
     } else {
       // For URL data, fetch and download
       fetch(qrCodeData)
-        .then(response => response.blob())
-        .then(blob => {
+        .then((response) => response.blob())
+        .then((blob) => {
           const url = window.URL.createObjectURL(blob);
-          const link = document.createElement('a');
+          const link = document.createElement("a");
           link.href = url;
           link.download = `QR_${orderId}.png`;
           document.body.appendChild(link);
@@ -62,14 +65,14 @@ function downloadQRCode(qrCodeData: string, orderId: string): void {
           document.body.removeChild(link);
           window.URL.revokeObjectURL(url);
         })
-        .catch(error => {
-          console.error('Failed to download QR code:', error);
-          alert('Không thể tải xuống QR code. Vui lòng thử lại.');
+        .catch((error) => {
+          console.error("Failed to download QR code:", error);
+          alert("Không thể tải xuống QR code. Vui lòng thử lại.");
         });
     }
   } catch (error) {
-    console.error('Error downloading QR code:', error);
-    alert('Không thể tải xuống QR code. Vui lòng thử lại.');
+    console.error("Error downloading QR code:", error);
+    alert("Không thể tải xuống QR code. Vui lòng thử lại.");
   }
 }
 
@@ -139,32 +142,42 @@ export default function ClientOnlyPaymentPage({
     const currentStatus = paymentData.odrStatus;
     const timestamp = paymentData.timestamp;
 
-    console.log('📥 [Payment-Direct] Fetching current status for order:', orderId);
-    
-    fetchOrderStatus(orderId).then((dbStatus) => {
-      if (dbStatus) {
-        console.log('✅ [Payment-Direct] Current status from DB:', dbStatus.odr_status);
-        
-        // Update payment data with current status from database
-        if (dbStatus.odr_status !== currentStatus) {
-          setPaymentData((prevData) => {
-            if (!prevData) return null;
-            return {
-              ...prevData,
-              odrStatus: dbStatus.odr_status,
-            };
-          });
+    console.log(
+      "📥 [Payment-Direct] Fetching current status for order:",
+      orderId
+    );
 
-          // Update effective status based on current database status
-          setEffectiveStatus(getEffectivePaymentStatus(
-            dbStatus.odr_status,
-            timestamp
-          ));
+    fetchOrderStatus(orderId)
+      .then((dbStatus) => {
+        if (dbStatus) {
+          console.log(
+            "✅ [Payment-Direct] Current status from DB:",
+            dbStatus.odr_status
+          );
+
+          // Update payment data with current status from database
+          if (dbStatus.odr_status !== currentStatus) {
+            setPaymentData((prevData) => {
+              if (!prevData) return null;
+              return {
+                ...prevData,
+                odrStatus: dbStatus.odr_status,
+              };
+            });
+
+            // Update effective status based on current database status
+            setEffectiveStatus(
+              getEffectivePaymentStatus(dbStatus.odr_status, timestamp)
+            );
+          }
         }
-      }
-    }).catch((error) => {
-      console.error('❌ [Payment-Direct] Failed to fetch current status:', error);
-    });
+      })
+      .catch((error) => {
+        console.error(
+          "❌ [Payment-Direct] Failed to fetch current status:",
+          error
+        );
+      });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paymentData?.odrId]); // Only run once when order ID is available
 
@@ -173,17 +186,24 @@ export default function ClientOnlyPaymentPage({
     // Only subscribe if we have payment data and it's in processing/pending status
     if (
       paymentData?.odrId &&
-      (paymentData.odrStatus === "processing" || paymentData.odrStatus === "pending") &&
+      (paymentData.odrStatus === "processing" ||
+        paymentData.odrStatus === "pending") &&
       !unsubscribeRef.current
     ) {
-      console.log('🔔 [Payment-Direct] Subscribing to Supabase realtime for order:', paymentData.odrId);
-      
+      console.log(
+        "🔔 [Payment-Direct] Subscribing to Supabase realtime for order:",
+        paymentData.odrId
+      );
+
       // Subscribe to Supabase realtime for this order
       const unsubscribe = subscribeToOrderChanges(
         paymentData.odrId,
         (updatedOrder: BackupOrder) => {
-          console.log('✅ [Payment-Direct] Received realtime update:', updatedOrder);
-          
+          console.log(
+            "✅ [Payment-Direct] Received realtime update:",
+            updatedOrder
+          );
+
           // Order status changed in Supabase
           if (updatedOrder.odr_status !== paymentData.odrStatus) {
             setPaymentData((prevData) => {
@@ -219,7 +239,7 @@ export default function ClientOnlyPaymentPage({
           }
         },
         (error) => {
-          console.error('❌ [Payment-Direct] Supabase realtime error:', error);
+          console.error("❌ [Payment-Direct] Supabase realtime error:", error);
         }
       );
 
@@ -231,7 +251,9 @@ export default function ClientOnlyPaymentPage({
       paymentData?.odrStatus !== "pending" &&
       unsubscribeRef.current
     ) {
-      console.log('🔕 [Payment-Direct] Unsubscribing from realtime (status changed)');
+      console.log(
+        "🔕 [Payment-Direct] Unsubscribing from realtime (status changed)"
+      );
       unsubscribeRef.current();
       unsubscribeRef.current = null;
     }
@@ -239,7 +261,9 @@ export default function ClientOnlyPaymentPage({
     // Clean up subscription when component unmounts
     return () => {
       if (unsubscribeRef.current) {
-        console.log('🔕 [Payment-Direct] Unsubscribing from realtime (unmount)');
+        console.log(
+          "🔕 [Payment-Direct] Unsubscribing from realtime (unmount)"
+        );
         unsubscribeRef.current();
         unsubscribeRef.current = null;
       }
@@ -307,11 +331,13 @@ export default function ClientOnlyPaymentPage({
   const formattedAmount = useMemo(() => {
     if (!paymentData) return "";
     // Always use vi-VN locale for consistent formatting
-    return new Intl.NumberFormat("vi-VN", {
-      style: "decimal",
-      minimumFractionDigits: 0,
-      maximumFractionDigits: 0,
-    }).format(paymentData.amount) + " VND";
+    return (
+      new Intl.NumberFormat("vi-VN", {
+        style: "decimal",
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 0,
+      }).format(paymentData.amount) + " VND"
+    );
   }, [paymentData]);
 
   // Memoize formatted timestamp
@@ -325,24 +351,29 @@ export default function ClientOnlyPaymentPage({
   // Generate QR code using QRLocal-compatible client-side generator
   useEffect(() => {
     // Only generate QR if we don't have one from server and we have bank info
-    if (!paymentData?.qrCode && paymentData?.bankBinCode && paymentData?.accountNumber && isClient) {
+    if (
+      !paymentData?.qrCode &&
+      paymentData?.bankBinCode &&
+      paymentData?.accountNumber &&
+      isClient
+    ) {
       setQrLoading(true);
-      
+
       generateClientQR({
         bankBin: paymentData.bankBinCode,
         accountNumber: paymentData.accountNumber,
         amount: Math.floor(paymentData.amount),
-        orderId: paymentData.odrId
+        orderId: paymentData.odrId,
       })
-        .then(result => {
+        .then((result) => {
           if (result.success && result.qrDataURL) {
             setGeneratedQR(result.qrDataURL);
           } else {
-            console.error('QR generation failed:', result.message);
+            console.error("QR generation failed:", result.message);
           }
         })
-        .catch(error => {
-          console.error('QR generation error:', error);
+        .catch((error) => {
+          console.error("QR generation error:", error);
         })
         .finally(() => {
           setQrLoading(false);
@@ -353,23 +384,29 @@ export default function ClientOnlyPaymentPage({
   // Use the generated QR or the one from server
   const qrCodeUrl = useMemo(() => {
     if (!paymentData) return null;
-    
+
     // If QR code is provided from server, use it
     if (paymentData.qrCode) {
       return paymentData.qrCode;
     }
-    
+
     // Use client-generated QR
     if (generatedQR) {
       return generatedQR;
     }
-    
+
     // Fallback to VietQR URL if generation is in progress or failed
     if (paymentData.bankBinCode && paymentData.accountNumber) {
       const qrTemplate = appConfig.qrTemplateCode;
-      return `https://img.vietqr.io/image/${paymentData.bankBinCode}-${paymentData.accountNumber}-${qrTemplate}.png?amount=${Math.floor(paymentData.amount)}&addInfo=${encodeURIComponent(paymentData.odrId)}&accountName=${encodeURIComponent(paymentData.accountName || '')}`;
+      return `https://img.vietqr.io/image/${paymentData.bankBinCode}-${
+        paymentData.accountNumber
+      }-${qrTemplate}.png?amount=${Math.floor(
+        paymentData.amount
+      )}&addInfo=${encodeURIComponent(
+        paymentData.odrId
+      )}&accountName=${encodeURIComponent(paymentData.accountName || "")}`;
     }
-    
+
     return null;
   }, [paymentData, generatedQR]);
 

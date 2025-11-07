@@ -3,7 +3,6 @@
  * Admin API: Cache Merchant Account in Supabase
  * 
  * This endpoint reads a merchant account from Appwrite and caches it in Supabase
- * Required before enabling useClientOnlyPayment mode for a merchant
  * 
  * POST /api/admin/cache-merchant
  * Authorization: Bearer INTERNAL_API_SECRET
@@ -46,15 +45,60 @@ export async function POST(request: NextRequest) {
 
     await log.info('Admin API: Caching merchant account', { merchantId, force });
 
-    // 3. Get merchant account from Appwrite
-    const merchantAccount = await getAccount(merchantId);
-
-    if (!merchantAccount) {
-      await log.warn('Admin API: Merchant not found in Appwrite', { merchantId });
-      return NextResponse.json(
-        { success: false, message: 'Merchant account not found in main database' },
-        { status: 404 }
+    // 3. Get merchant account - check database mode
+    const { getCoreRunningMode } = await import('@/lib/appconfig');
+    const { loadAppConfig } = await import('@/lib/json/config-loader');
+    const runningMode = getCoreRunningMode();
+    
+    let merchantAccount;
+    
+    if (runningMode === 'supabase') {
+      // When running in Supabase-only mode, get merchant from config file
+      const jsonConfig = loadAppConfig();
+      const merchants = jsonConfig.merchants || {};
+      
+      const merchantConfig = Object.entries(merchants).find(
+        ([, merchant]) => merchant.accountId === merchantId
       );
+      
+      if (!merchantConfig) {
+        await log.warn('Admin API: Merchant not found in config', { merchantId });
+        return NextResponse.json(
+          { success: false, message: 'Merchant not found in configuration. Please add to lib/json/appconfig.json' },
+          { status: 404 }
+        );
+      }
+      
+      const [merchantName, merchantData] = merchantConfig;
+      
+      // Create merchant object from config
+      merchantAccount = {
+        $id: merchantId,
+        publicTransactionId: merchantId,
+        apiKey: '', // Will be derived from apiKeyHash
+        apiKeyHash: merchantData.apiKeyHash,
+        accountName: merchantName,
+        avaiableBalance: 0,
+        minDepositAmount: merchantData.minDepositAmount || 0,
+        maxDepositAmount: merchantData.maxDepositAmount || 0,
+        minWithdrawAmount: merchantData.minWithdrawAmount || 0,
+        maxWithdrawAmount: merchantData.maxWithdrawAmount || 0,
+        depositWhitelistIps: merchantData.depositWhitelistIps || [],
+        withdrawWhitelistIps: merchantData.withdrawWhitelistIps || [],
+      };
+      
+      await log.info('Admin API: Using merchant from config (Supabase mode)', { merchantId, merchantName });
+    } else {
+      // When running in Appwrite mode, get from Appwrite
+      merchantAccount = await getAccount(merchantId);
+
+      if (!merchantAccount) {
+        await log.warn('Admin API: Merchant not found in Appwrite', { merchantId });
+        return NextResponse.json(
+          { success: false, message: 'Merchant account not found in main database' },
+          { status: 404 }
+        );
+      }
     }
 
     // 4. Cache in Supabase
@@ -83,9 +127,11 @@ export async function POST(request: NextRequest) {
     }
 
     // Cache merchant data
+    // Note: When in Supabase mode, api_key will be the hash (since we don't have plain API keys)
+    // The verification will use hash comparison instead
     const result = await cacheService.cacheMerchantAccount({
       merchant_id: merchantAccount.publicTransactionId,
-      api_key: merchantAccount.apiKey,
+      api_key: merchantAccount.apiKey || merchantAccount.apiKeyHash || '', // Use hash if no plain key
       account_name: merchantAccount.accountName,
       available_balance: merchantAccount.avaiableBalance,
       min_deposit_amount: merchantAccount.minDepositAmount,

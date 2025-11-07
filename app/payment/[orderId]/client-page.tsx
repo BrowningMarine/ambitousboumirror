@@ -11,7 +11,10 @@ import {
 } from "@/lib/utils";
 import { subscribeToCollection } from "@/lib/client/appwriteSubcriptions";
 import { appwriteConfig } from "@/lib/appwrite/appwrite-config";
-import { subscribeToOrderChanges, fetchOrderStatus } from "@/lib/supabase-client"; // CLIENT-SIDE module
+import {
+  subscribeToOrderChanges,
+  fetchOrderStatus,
+} from "@/lib/client/supabase-client"; // CLIENT-SIDE module
 import { BackupOrder } from "@/lib/supabase-backup"; // Type only
 
 // Define TypeScript interfaces
@@ -70,7 +73,7 @@ function downloadQRCode(qrCodeData: string, orderId: string): void {
   try {
     if (isBase64Image(qrCodeData)) {
       // For base64 data, create a download link
-      const link = document.createElement('a');
+      const link = document.createElement("a");
       link.href = qrCodeData;
       link.download = `QR_${orderId}.png`;
       document.body.appendChild(link);
@@ -79,10 +82,10 @@ function downloadQRCode(qrCodeData: string, orderId: string): void {
     } else {
       // For URL data, fetch and download
       fetch(qrCodeData)
-        .then(response => response.blob())
-        .then(blob => {
+        .then((response) => response.blob())
+        .then((blob) => {
           const url = window.URL.createObjectURL(blob);
-          const link = document.createElement('a');
+          const link = document.createElement("a");
           link.href = url;
           link.download = `QR_${orderId}.png`;
           document.body.appendChild(link);
@@ -90,14 +93,14 @@ function downloadQRCode(qrCodeData: string, orderId: string): void {
           document.body.removeChild(link);
           window.URL.revokeObjectURL(url);
         })
-        .catch(error => {
-          console.error('Failed to download QR code:', error);
-          alert('Không thể tải xuống QR code. Vui lòng thử lại.');
+        .catch((error) => {
+          console.error("Failed to download QR code:", error);
+          alert("Không thể tải xuống QR code. Vui lòng thử lại.");
         });
     }
   } catch (error) {
-    console.error('Error downloading QR code:', error);
-    alert('Không thể tải xuống QR code. Vui lòng thử lại.');
+    console.error("Error downloading QR code:", error);
+    alert("Không thể tải xuống QR code. Vui lòng thử lại.");
   }
 }
 
@@ -282,7 +285,12 @@ export default function ClientPaymentPage({
         unsubscribeRef.current = null;
       }
     };
-  }, [orderId, paymentData?.odrStatus, handleTransactionUpdate, initialData.clientOnlyMode]);
+  }, [
+    orderId,
+    paymentData?.odrStatus,
+    handleTransactionUpdate,
+    initialData.clientOnlyMode,
+  ]);
 
   // Track if we're on the client side to prevent hydration mismatch
   useEffect(() => {
@@ -293,32 +301,39 @@ export default function ClientPaymentPage({
   useEffect(() => {
     if (!initialData.clientOnlyMode || !orderId || !paymentData) return;
 
-    console.log('📥 [Payment] Fetching current status for order:', orderId);
-    
-    fetchOrderStatus(orderId).then((currentStatus) => {
-      if (currentStatus) {
-        console.log('✅ [Payment] Current status from DB:', currentStatus.odr_status);
-        
-        // Update payment data with current status from database
-        if (currentStatus.odr_status !== paymentData.odrStatus) {
-          setPaymentData((prevData) => {
-            if (!prevData) return null;
-            return {
-              ...prevData,
-              odrStatus: currentStatus.odr_status,
-            };
-          });
+    console.log("📥 [Payment] Fetching current status for order:", orderId);
 
-          // Update effective status based on current database status
-          setEffectiveStatus(getEffectivePaymentStatus(
-            currentStatus.odr_status,
-            paymentData.timestamp
-          ));
+    fetchOrderStatus(orderId)
+      .then((currentStatus) => {
+        if (currentStatus) {
+          console.log(
+            "✅ [Payment] Current status from DB:",
+            currentStatus.odr_status
+          );
+
+          // Update payment data with current status from database
+          if (currentStatus.odr_status !== paymentData.odrStatus) {
+            setPaymentData((prevData) => {
+              if (!prevData) return null;
+              return {
+                ...prevData,
+                odrStatus: currentStatus.odr_status,
+              };
+            });
+
+            // Update effective status based on current database status
+            setEffectiveStatus(
+              getEffectivePaymentStatus(
+                currentStatus.odr_status,
+                paymentData.timestamp
+              )
+            );
+          }
         }
-      }
-    }).catch((error) => {
-      console.error('❌ [Payment] Failed to fetch current status:', error);
-    });
+      })
+      .catch((error) => {
+        console.error("❌ [Payment] Failed to fetch current status:", error);
+      });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [orderId, initialData.clientOnlyMode]); // Run when order ID or mode changes
 
@@ -424,11 +439,13 @@ export default function ClientPaymentPage({
   const formattedAmount = useMemo(() => {
     if (!paymentData) return "";
     // Always use vi-VN locale for consistent formatting
-    return new Intl.NumberFormat("vi-VN", {
-      style: "decimal",
-      minimumFractionDigits: 0,
-      maximumFractionDigits: 0,
-    }).format(paymentData.amount) + " VND";
+    return (
+      new Intl.NumberFormat("vi-VN", {
+        style: "decimal",
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 0,
+      }).format(paymentData.amount) + " VND"
+    );
   }, [paymentData]);
 
   // Memoize formatted timestamp
@@ -1013,7 +1030,10 @@ export default function ClientPaymentPage({
               {/* Download QR Button */}
               <div className="mt-4">
                 <button
-                  onClick={() => paymentData.qrCode && downloadQRCode(paymentData.qrCode, paymentData.odrId)}
+                  onClick={() =>
+                    paymentData.qrCode &&
+                    downloadQRCode(paymentData.qrCode, paymentData.odrId)
+                  }
                   className="px-4 py-2 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors duration-200 flex items-center gap-2 mx-auto"
                 >
                   <Download className="w-4 h-4" />

@@ -10,7 +10,7 @@ import { getAccountsByUserRole, updateAccountBalance } from "./account.actions";
 import { getBankById, validateBankAccount } from "./bank.actions";
 import { Account, VietQRResponse } from "@/types";
 import { ID } from "appwrite";
-import { sendWebhookNotification } from "@/utils/webhook";
+// import { sendWebhookNotification } from "@/utils/webhook"; // Deprecated: Now handled by batched webhook response
 import axios from "axios";
 import { scheduleTransactionExpiry } from "@/lib/redisJobScheduler";
 import { fromLocalDateString, setStartOfDay, setEndOfDay, getStartOfDayUTC, getEndOfDayUTC } from "@/lib/utils";
@@ -676,56 +676,12 @@ export async function updateTransactionStatus(
         }
       }
 
-      // Send webhook notification in background when newStatus is latest status
-      if (transaction.urlCallBack) {
-        // Create webhook data
-        const webhookData = {
-          odrId: transaction.odrId,
-          merchantOrdId: transaction.merchantOrdId || '',
-          orderType: transaction.odrType,
-          odrStatus: newStatus,
-          bankReceiveNumber: transaction.bankReceiveNumber || '',
-          bankReceiveOwnerName: transaction.bankReceiveOwnerName || '',
-          amount: transaction.paidAmount || 0,
-        };
-
-        // Get merchant API key if available
-        const merchantApiKey = transaction.account?.apiKey || '';
-
-        // VERCEL OPTIMIZATION: Use setImmediate to prevent blocking the main request
-        setImmediate(async () => {
-          try {
-            const webhookResult = await sendWebhookNotification(
-              transaction.urlCallBack!,
-              webhookData,
-              merchantApiKey,
-              true,
-              'updateTransactionStatus'
-            );
-            
-            // Only update if webhook was successfully sent
-            if (webhookResult.success) {
-              try {
-                // Use write client for webhook status update
-                const writeClient = await DatabaseOptimizer.getWriteClient();
-                await writeClient.database.updateDocument(
-                  DATABASE_ID,
-                  ODRTRANS_COLLECTION_ID,
-                  transactionId,
-                  {
-                    isSentCallbackNotification: true
-                  }
-                );
-              } catch (updateError) {
-                console.error('Error updating webhook status:', updateError);
-              }
-            }
-          } catch (webhookError) {
-            console.error('Error sending webhook notification:', webhookError);
-            // Webhook failure doesn't affect transaction processing
-          }
-        });
-      }
+      // WEBHOOK NOTIFICATIONS NOW HANDLED BY BATCHED WEBHOOK RESPONSE
+      // The webhook response handler (lib/webhook/webhook-response.ts) sends batched notifications
+      // after all transactions are processed, grouping by callback URL for efficiency
+      
+      // Deprecated: Individual webhook sending in updateTransactionStatus
+      // if (transaction.urlCallBack) { ... webhookData ... sendWebhookNotification ... }
     }
 
     return {
@@ -847,55 +803,16 @@ export async function proccessTransactionPayment(
           );
         }
 
-        // Send webhook notification in background (non-blocking)
-        if (transaction.urlCallBack) {
-          // Create webhook data
-          const webhookData = {
-            odrId: transaction.odrId,
-            merchantOrdId: transaction.merchantOrdId || '',
-            orderType: transaction.odrType,
-            odrStatus: newStatus,
-            bankReceiveNumber: transaction.bankReceiveNumber || '',
-            bankReceiveOwnerName: transaction.bankReceiveOwnerName || '',
-            amount: newPaidAmount,
-          };
-
-          // Get merchant API key if available
-          const merchantApiKey = transaction.account?.apiKey || '';
-
-          // VERCEL OPTIMIZATION: Use setImmediate to prevent blocking the main request
-          setImmediate(async () => {
-            try {
-              const webhookResult = await sendWebhookNotification(
-                transaction.urlCallBack!,
-                webhookData,
-                merchantApiKey,
-                true,
-                'proccessTransactionPayment'
-              );
-              
-              // Only update if webhook was successfully sent
-              if (webhookResult.success) {
-                try {
-                  await dbManager.updateDocument(
-                    DATABASE_ID,
-                    ODRTRANS_COLLECTION_ID,
-                    transaction.$id,
-                    {
-                      isSentCallbackNotification: true
-                    },
-                    `webhook-status-${odrId}`
-                  );
-                } catch (updateError) {
-                  console.error(`Error updating webhook status for order ${odrId}:`, updateError);
-                }
-              }
-            } catch (webhookError) {
-              console.error(`Error sending webhook notification for order ${odrId}:`, webhookError);
-              // Webhook failure doesn't affect transaction processing
-            }
-          });
-        }
+        // WEBHOOK NOTIFICATIONS NOW HANDLED BY BATCHED WEBHOOK RESPONSE
+        // The webhook response handler (lib/webhook/webhook-response.ts) sends batched notifications
+        // after all transactions are processed, grouping by callback URL for efficiency
+        
+        // Deprecated: Individual webhook sending - now replaced by batching system
+        // if (transaction.urlCallBack) {
+        //   ... webhook sending code removed to enable batching ...
+        // }
+        
+        // Note: Webhook status (isSentCallbackNotification) is updated by the webhook response handler
       } catch (error) {
         console.error('Error updating account balance:', error);
         // Continue execution even if these operations fail

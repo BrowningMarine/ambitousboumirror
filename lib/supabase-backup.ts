@@ -9,8 +9,8 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
 // Environment variables
-const SUPABASE_URL = process.env.SUPABASE_URL || '';
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+const SUPABASE_URL = process.env.SUPABASE_BK_URL || '';
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_BK_SERVICE_KEY || '';
 
 // Singleton client
 let supabaseClient: SupabaseClient | null = null;
@@ -222,10 +222,12 @@ export class MerchantAccountCacheService {
 
   /**
    * Get merchant account by API key
+   * Supports both plain API key and hash comparison
    */
   async getMerchantByApiKey(apiKey: string, merchantId: string): Promise<MerchantAccountCache | null> {
     try {
-      const { data, error } = await this.supabase
+      // First try exact match (for backward compatibility with plain keys)
+      let { data, error } = await this.supabase
         .from('merchant_accounts_cache')
         .select('*')
         .eq('api_key', apiKey)
@@ -233,10 +235,30 @@ export class MerchantAccountCacheService {
         .eq('status', true)
         .single();
 
-      if (error || !data) return null;
+      // If not found, try hash comparison
+      if (error || !data) {
+        const crypto = await import('crypto');
+        const apiKeyHash = crypto.createHash('sha256').update(apiKey).digest('hex');
+        const hashResult = await this.supabase
+          .from('merchant_accounts_cache')
+          .select('*')
+          .eq('api_key', apiKeyHash)
+          .eq('merchant_id', merchantId)
+          .eq('status', true)
+          .single();
+        
+        data = hashResult.data;
+        error = hashResult.error;
+      }
+
+      if (error || !data) {
+        console.log('❌ Merchant not found in cache');
+        return null;
+      }
+      
       return data as MerchantAccountCache;
     } catch (error) {
-      console.error('Failed to get merchant from cache:', error);
+      console.error('❌ Failed to get merchant from cache:', error);
       return null;
     }
   }
@@ -353,6 +375,11 @@ export class BackupOrderService {
 
       if (error || !data) return null;
 
+      // Trim whitespace from status
+      if (data.odr_status) {
+        data.odr_status = data.odr_status.trim();
+      }
+
       return data as BackupOrder;
     } catch (error) {
       console.error('Failed to get backup order:', error);
@@ -412,7 +439,15 @@ export class BackupOrderService {
 
       if (error) throw error;
 
-      return (data || []) as BackupOrder[];
+      // Trim whitespace from status for all orders
+      const orders = (data || []) as BackupOrder[];
+      orders.forEach(order => {
+        if (order.odr_status) {
+          order.odr_status = order.odr_status.trim();
+        }
+      });
+
+      return orders;
     } catch (error) {
       console.error('Failed to get unsynced orders:', error);
       return [];

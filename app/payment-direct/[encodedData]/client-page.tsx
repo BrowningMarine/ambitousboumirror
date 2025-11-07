@@ -11,7 +11,10 @@ import {
 } from "@/lib/utils";
 import type { PaymentData } from "@/lib/payment-encoder";
 import { generateClientQR } from "@/lib/client-qr-generator";
-import { subscribeToOrderChanges, fetchOrderStatus } from "@/lib/supabase-client";
+import {
+  subscribeToOrderChanges,
+  fetchOrderStatus,
+} from "@/lib/client/supabase-client";
 import { BackupOrder } from "@/lib/supabase-backup";
 
 // Define TypeScript interfaces
@@ -42,7 +45,7 @@ function downloadQRCode(qrCodeData: string, orderId: string): void {
   try {
     if (isBase64Image(qrCodeData)) {
       // For base64 data, create a download link
-      const link = document.createElement('a');
+      const link = document.createElement("a");
       link.href = qrCodeData;
       link.download = `QR_${orderId}.png`;
       document.body.appendChild(link);
@@ -51,10 +54,10 @@ function downloadQRCode(qrCodeData: string, orderId: string): void {
     } else {
       // For URL data, fetch and download
       fetch(qrCodeData)
-        .then(response => response.blob())
-        .then(blob => {
+        .then((response) => response.blob())
+        .then((blob) => {
           const url = window.URL.createObjectURL(blob);
-          const link = document.createElement('a');
+          const link = document.createElement("a");
           link.href = url;
           link.download = `QR_${orderId}.png`;
           document.body.appendChild(link);
@@ -63,11 +66,11 @@ function downloadQRCode(qrCodeData: string, orderId: string): void {
           window.URL.revokeObjectURL(url);
         })
         .catch(() => {
-          alert('Không thể tải xuống QR code. Vui lòng thử lại.');
+          alert("Không thể tải xuống QR code. Vui lòng thử lại.");
         });
     }
   } catch {
-    alert('Không thể tải xuống QR code. Vui lòng thử lại.');
+    alert("Không thể tải xuống QR code. Vui lòng thử lại.");
   }
 }
 
@@ -118,9 +121,12 @@ export default function ClientOnlyPaymentPage({
   const [isClient, setIsClient] = useState(false);
   const [generatedQR, setGeneratedQR] = useState<string | null>(null);
   const [qrLoading, setQrLoading] = useState(false);
-  
+
   // Track if we've loaded the current status from database (prevents flash on refresh)
   const [statusLoaded, setStatusLoaded] = useState(false);
+
+  // Track if we're in fallback mode (no database updates)
+  const [isFallbackMode, setIsFallbackMode] = useState(false);
 
   // Use ref for subscription to avoid state updates and re-renders
   const unsubscribeRef = useRef<(() => void) | null>(null);
@@ -130,95 +136,135 @@ export default function ClientOnlyPaymentPage({
     setIsClient(true);
   }, []);
 
-  // Fetch current order status from database on mount
+  // Fetch current order status from database on mount (skip in fallback mode)
   useEffect(() => {
     if (!paymentData?.odrId) return;
 
-    const orderId = paymentData.odrId;
-    const currentStatus = paymentData.odrStatus;
-    const timestamp = paymentData.timestamp;
-    
-    fetchOrderStatus(orderId).then((dbStatus) => {
-      if (dbStatus) {
-        // Update payment data with current status from database
-        if (dbStatus.odr_status !== currentStatus) {
-          setPaymentData((prevData) => {
-            if (!prevData) return null;
-            return {
-              ...prevData,
-              odrStatus: dbStatus.odr_status,
-            };
-          });
+    // Check if we're in fallback mode via config
+    const checkFallbackMode = async () => {
+      try {
+        const response = await fetch("/api/realtime-config");
+        const config = await response.json();
 
-          // Update effective status based on current database status
-          setEffectiveStatus(getEffectivePaymentStatus(
-            dbStatus.odr_status,
-            timestamp
-          ));
+        // If fallback mode, skip database queries entirely
+        if (config.mode === "fallback") {
+          console.log(
+            "🟡 [Payment-Direct] Fallback mode - skipping database status check"
+          );
+          setIsFallbackMode(true);
+          setStatusLoaded(true);
+          return;
         }
+
+        // Otherwise, fetch status from database
+        const orderId = paymentData.odrId;
+        const currentStatus = paymentData.odrStatus;
+        const timestamp = paymentData.timestamp;
+
+        const dbStatus = await fetchOrderStatus(orderId);
+        if (dbStatus) {
+          // Update payment data with current status from database
+          if (dbStatus.odr_status !== currentStatus) {
+            setPaymentData((prevData) => {
+              if (!prevData) return null;
+              return {
+                ...prevData,
+                odrStatus: dbStatus.odr_status,
+              };
+            });
+
+            // Update effective status based on current database status
+            setEffectiveStatus(
+              getEffectivePaymentStatus(dbStatus.odr_status, timestamp)
+            );
+          }
+        }
+
+        // Mark status as loaded (prevents showing initial state flash)
+        setStatusLoaded(true);
+      } catch {
+        // Even on error, mark as loaded so we don't show loading forever
+        setStatusLoaded(true);
       }
-      
-      // Mark status as loaded (prevents showing initial state flash)
-      setStatusLoaded(true);
-    }).catch(() => {
-      // Even on error, mark as loaded so we don't show loading forever
-      setStatusLoaded(true);
-    });
+    };
+
+    checkFallbackMode();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paymentData?.odrId]); // Only run once when order ID is available
 
-  // Set up Supabase realtime subscription for order status updates
+  // Set up realtime subscription for order status updates (skip in fallback mode)
   useEffect(() => {
     // Only subscribe if we have payment data and it's in processing/pending status
     if (
       paymentData?.odrId &&
-      (paymentData.odrStatus === "processing" || paymentData.odrStatus === "pending") &&
+      (paymentData.odrStatus === "processing" ||
+        paymentData.odrStatus === "pending") &&
       !unsubscribeRef.current
     ) {
-      // Subscribe to Supabase realtime for this order
-      const unsubscribe = subscribeToOrderChanges(
-        paymentData.odrId,
-        (updatedOrder: BackupOrder) => {
-          // Order status changed in Supabase
-          if (updatedOrder.odr_status !== paymentData.odrStatus) {
-            setPaymentData((prevData) => {
-              if (!prevData) return null;
-
-              return {
-                ...prevData,
-                odrStatus: updatedOrder.odr_status,
-              };
-            });
-
-            // Update effective status
-            if (updatedOrder.odr_status === "pending") {
-              setEffectiveStatus("expired");
-            } else {
-              setEffectiveStatus(updatedOrder.odr_status);
-            }
-
-            // Set notification based on new status
-            setStatusChanged(true);
-
-            if (updatedOrder.odr_status === "completed") {
-              setStatusMessage("Thanh toán đã hoàn thành thành công!");
-            } else if (updatedOrder.odr_status === "failed") {
-              setStatusMessage("Thanh toán đã thất bại. Vui lòng thử lại.");
-            } else if (updatedOrder.odr_status === "canceled") {
-              setStatusMessage("Thanh toán đã bị hủy.");
-            } else if (updatedOrder.odr_status === "pending") {
-              setStatusMessage(
-                "Đơn hàng đã được cập nhật, nhưng đã hết thời gian thanh toán."
-              );
-            }
+      // Check if we're in fallback mode first
+      fetch("/api/realtime-config")
+        .then((res) => res.json())
+        .then((config) => {
+          // If fallback mode, skip subscription entirely
+          if (config.mode === "fallback") {
+            console.log(
+              "🟡 [Payment-Direct] Fallback mode - skipping realtime subscription (no database)"
+            );
+            setIsFallbackMode(true);
+            return;
           }
-        },
-        () => {
-          // Error handler - silently ignore realtime errors
-        }
-      );
 
-      unsubscribeRef.current = unsubscribe;
+          // Otherwise, subscribe to realtime for this order
+          const unsubscribe = subscribeToOrderChanges(
+            paymentData.odrId,
+            (updatedOrder: BackupOrder) => {
+              // Order status changed in database
+              if (updatedOrder.odr_status !== paymentData.odrStatus) {
+                setPaymentData((prevData) => {
+                  if (!prevData) return null;
+
+                  return {
+                    ...prevData,
+                    odrStatus: updatedOrder.odr_status,
+                  };
+                });
+
+                // Update effective status
+                if (updatedOrder.odr_status === "pending") {
+                  setEffectiveStatus("expired");
+                } else {
+                  setEffectiveStatus(updatedOrder.odr_status);
+                }
+
+                // Set notification based on new status
+                setStatusChanged(true);
+
+                if (updatedOrder.odr_status === "completed") {
+                  setStatusMessage("Thanh toán đã hoàn thành thành công!");
+                } else if (updatedOrder.odr_status === "failed") {
+                  setStatusMessage("Thanh toán đã thất bại. Vui lòng thử lại.");
+                } else if (updatedOrder.odr_status === "canceled") {
+                  setStatusMessage("Thanh toán đã bị hủy.");
+                } else if (updatedOrder.odr_status === "pending") {
+                  setStatusMessage(
+                    "Đơn hàng đã được cập nhật, nhưng đã hết thời gian thanh toán."
+                  );
+                }
+              }
+            },
+            () => {
+              // Error handler - silently ignore realtime errors
+            }
+          );
+
+          unsubscribeRef.current = unsubscribe;
+        })
+        .catch(() => {
+          // Config fetch failed - assume not fallback mode and try subscribing anyway
+          console.warn(
+            "[Payment-Direct] Failed to check mode - attempting subscription"
+          );
+        });
     }
     // If payment is no longer processing/pending but we have an active subscription, unsubscribe
     else if (
@@ -300,11 +346,13 @@ export default function ClientOnlyPaymentPage({
   const formattedAmount = useMemo(() => {
     if (!paymentData) return "";
     // Always use vi-VN locale for consistent formatting
-    return new Intl.NumberFormat("vi-VN", {
-      style: "decimal",
-      minimumFractionDigits: 0,
-      maximumFractionDigits: 0,
-    }).format(paymentData.amount) + " VND";
+    return (
+      new Intl.NumberFormat("vi-VN", {
+        style: "decimal",
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 0,
+      }).format(paymentData.amount) + " VND"
+    );
   }, [paymentData]);
 
   // Memoize formatted timestamp
@@ -318,16 +366,21 @@ export default function ClientOnlyPaymentPage({
   // Generate QR code using QRLocal-compatible client-side generator
   useEffect(() => {
     // Only generate QR if we don't have one from server and we have bank info
-    if (!paymentData?.qrCode && paymentData?.bankBinCode && paymentData?.accountNumber && isClient) {
+    if (
+      !paymentData?.qrCode &&
+      paymentData?.bankBinCode &&
+      paymentData?.accountNumber &&
+      isClient
+    ) {
       setQrLoading(true);
-      
+
       generateClientQR({
         bankBin: paymentData.bankBinCode,
         accountNumber: paymentData.accountNumber,
         amount: Math.floor(paymentData.amount),
-        orderId: paymentData.odrId
+        orderId: paymentData.odrId,
       })
-        .then(result => {
+        .then((result) => {
           if (result.success && result.qrDataURL) {
             setGeneratedQR(result.qrDataURL);
           }
@@ -344,30 +397,36 @@ export default function ClientOnlyPaymentPage({
   // Use the generated QR or the one from server
   const qrCodeUrl = useMemo(() => {
     if (!paymentData) return null;
-    
+
     // If QR code is provided from server, use it
     if (paymentData.qrCode) {
       return paymentData.qrCode;
     }
-    
+
     // Use client-generated QR
     if (generatedQR) {
       return generatedQR;
     }
-    
+
     // Fallback to VietQR URL if generation is in progress or failed
     if (paymentData.bankBinCode && paymentData.accountNumber) {
       const qrTemplate = appConfig.qrTemplateCode;
-      return `https://img.vietqr.io/image/${paymentData.bankBinCode}-${paymentData.accountNumber}-${qrTemplate}.png?amount=${Math.floor(paymentData.amount)}&addInfo=${encodeURIComponent(paymentData.odrId)}&accountName=${encodeURIComponent(paymentData.accountName || '')}`;
+      return `https://img.vietqr.io/image/${paymentData.bankBinCode}-${
+        paymentData.accountNumber
+      }-${qrTemplate}.png?amount=${Math.floor(
+        paymentData.amount
+      )}&addInfo=${encodeURIComponent(
+        paymentData.odrId
+      )}&accountName=${encodeURIComponent(paymentData.accountName || "")}`;
     }
-    
+
     return null;
   }, [paymentData, generatedQR]);
 
   // Use merchant logo from appConfig if not provided
   const merchantLogo = useMemo(() => {
-    if (!paymentData) return '/icons/esomar-logo.png';
-    return paymentData.merchantLogoUrl || '/icons/esomar-logo.png';
+    if (!paymentData) return "/icons/esomar-logo.png";
+    return paymentData.merchantLogoUrl || "/icons/esomar-logo.png";
   }, [paymentData]);
 
   // Handle error state
@@ -443,7 +502,9 @@ export default function ClientOnlyPaymentPage({
         <div className="w-full max-w-md p-8 bg-white rounded-lg shadow-lg">
           <div className="text-center">
             <div className="inline-block animate-spin rounded-full h-16 w-16 border-b-2 border-blue-600"></div>
-            <h1 className="mt-4 text-xl font-bold text-gray-800">Đang tải...</h1>
+            <h1 className="mt-4 text-xl font-bold text-gray-800">
+              Đang tải...
+            </h1>
             <p className="mt-2 text-gray-600">Vui lòng đợi trong giây lát</p>
           </div>
         </div>
@@ -931,10 +992,13 @@ export default function ClientOnlyPaymentPage({
                 Trong khi chuyển khoản{" "}
                 <span className="font-bold">không làm mới trình duyệt.</span>
               </li>
-              {/* <li className="text-yellow-600 font-bold">
-                ⚠️ Trang này hoạt động độc lập và không cập nhật trạng thái thanh toán tự động. 
-                Vui lòng kiểm tra email hoặc thông báo callback từ hệ thống.
-              </li> */}
+              {isFallbackMode && (
+                <li className="text-yellow-600 font-bold">
+                  ⚠️ Trang này hoạt động ở chế độ độc lập (fallback mode). Không
+                  có cập nhật trạng thái tự động từ database. Vui lòng kiểm tra
+                  email hoặc thông báo callback để xác nhận thanh toán.
+                </li>
+              )}
             </ol>
           </div>
 

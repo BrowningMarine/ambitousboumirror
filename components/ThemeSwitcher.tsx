@@ -7,7 +7,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { Moon, Sun } from "lucide-react";
-import { useTheme } from "@/lib/theme-provider";
+import { useTheme } from "@/components/theme-provider";
 
 export default function ThemeToggle() {
   const { theme, toggleTheme } = useTheme();

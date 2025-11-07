@@ -7,8 +7,6 @@ import Loading from "./loading";
 import { DatabaseOptimizer } from "@/lib/database-optimizer";
 import { DatabaseQueryOptimizer } from "@/lib/database-query-optimizer";
 import { log } from "@/lib/logger";
-import { appConfig } from "@/lib/appconfig";
-import { BackupOrderService } from "@/lib/supabase-backup";
 
 // Disable Next.js caching for this dynamic route
 export const dynamic = "force-dynamic";
@@ -59,7 +57,6 @@ async function getPaymentData(orderId: string) {
     request: {
       cacheStrategy: "no-cache",
       useReadReplica: true,
-      clientOnlyMode: appConfig.useClientOnlyPayment,
     },
     order: {
       found: false,
@@ -86,68 +83,9 @@ async function getPaymentData(orderId: string) {
   };
 
   try {
-    // NEW: Check Supabase first if in client-only mode
-    if (appConfig.useClientOnlyPayment) {
-      const orderLookupStart = performance.now();
-      const backupService = new BackupOrderService();
-      const supabaseOrder = await backupService.getBackupOrder(orderId);
-      paymentViewLog.performance.orderLookupMs = performance.now() - orderLookupStart;
-      paymentViewLog.queries.orderLookup = {
-        success: !!supabaseOrder,
-        timeMs: paymentViewLog.performance.orderLookupMs,
-      };
+    // Standard Appwrite processing with automatic Supabase fallback
+    paymentViewLog.order.source = "appwrite";
 
-      if (supabaseOrder) {
-        paymentViewLog.order = {
-          found: true,
-          odrType: supabaseOrder.odr_type,
-          odrStatus: supabaseOrder.odr_status,
-          merchantId: supabaseOrder.merchant_id || "unknown",
-          amount: supabaseOrder.amount,
-          source: 'supabase',
-        };
-
-        // For client-only mode, we have limited data from Supabase
-        // Bank info is stored in the order itself
-        paymentViewLog.performance.totalTimeMs = performance.now() - requestStartTime;
-        paymentViewLog.result = {
-          success: true,
-          message: "Payment data retrieved from Supabase (client-only mode)",
-        };
-
-        return {
-          success: true,
-          data: {
-            odrId: supabaseOrder.odr_id,
-            merchantOrdId: supabaseOrder.merchant_odr_id || "",
-            odrStatus: supabaseOrder.odr_status,
-            bankName: supabaseOrder.bank_name || "",
-            accountNumber: supabaseOrder.account_number || "",
-            accountName: supabaseOrder.account_name || "",
-            amount: supabaseOrder.amount,
-            timestamp: supabaseOrder.created_at || supabaseOrder.last_payment_date || new Date().toISOString(),
-            qrCode: supabaseOrder.qr_code || null,
-            urlSuccess: supabaseOrder.url_success || "",
-            urlFailed: supabaseOrder.url_failed || "",
-            urlCanceled: supabaseOrder.url_canceled || "",
-            urlCallBack: supabaseOrder.url_callback || "",
-            merchantName: "", // Not available in Supabase backup
-            merchantlogoUrl: "", // Not available in Supabase backup
-          },
-          clientOnlyMode: true, // Flag to indicate client should use Supabase realtime
-        };
-      } else {
-        // Order not in Supabase, try Appwrite as fallback
-        await log.warn('Order not found in Supabase, checking Appwrite', {
-          orderId,
-          mode: 'client-only-fallback'
-        });
-      }
-    }
-
-    // Standard Appwrite processing (normal mode or fallback)
-    paymentViewLog.order.source = 'appwrite';
-    
     // Pre-warm read-only client for optimal performance (fire and forget)
     void DatabaseOptimizer.getReadOnlyClient();
 
@@ -156,9 +94,9 @@ async function getPaymentData(orderId: string) {
     const orderResult = await DatabaseQueryOptimizer.executeOptimizedQuery(
       ORDER_TRANS_COLLECTION_ID,
       [
-        Query.equal("odrId", orderId), 
+        Query.equal("odrId", orderId),
         Query.equal("odrType", "deposit"), // Only load deposit orders
-        Query.limit(1)
+        Query.limit(1),
       ],
       {
         useCache: false, // Disable cache to prevent cross-client data leakage
@@ -184,7 +122,7 @@ async function getPaymentData(orderId: string) {
       odrStatus: order.odrStatus,
       merchantId: order.account?.publicTransactionId || "unknown",
       amount: order.amount,
-      source: 'appwrite',
+      source: "appwrite",
     };
 
     // Parallel execution of dependent queries

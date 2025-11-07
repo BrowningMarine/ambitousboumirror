@@ -1,25 +1,18 @@
 import { NextResponse } from 'next/server';
+import { appConfig } from './appconfig';
 
 /**
  * Adds headers to allow frame embedding for specific trusted domains
  */
 export function allowFrameEmbedding(response: NextResponse) {
-  // Get trusted domains from environment variables
-  // Format in .env file: TRUSTED_DOMAINS=domain1.com,domain2.com,domain3.com
-  const trustedDomainsEnv = process.env.TRUSTED_DOMAINS || '';
+  // Get trusted domains from appconfig (fallback to env if needed)
+  const trustedDomains = appConfig.trustedDomains || [];
   
-  // Parse the comma-separated list into an array
-  const trustedDomains = trustedDomainsEnv
-    .split(',')
-    .map(domain => domain.trim())
-    .filter(domain => domain.length > 0) // Remove empty entries
-    .map(domain => domain.startsWith('https://') ? domain : `https://${domain}`); // Ensure https://
-    
   // Add self to the list of allowed domains
   let frameAncestors = `'self'`;
   
   // Determine if we should allow all domains
-  const allowAllDomains = process.env.ALLOW_ALL_FRAME_EMBEDDING === 'true';
+  const allowAllDomains = appConfig.allowAllFrameEmbedding;
   
   if (allowAllDomains) {
     // Allow all domains to embed

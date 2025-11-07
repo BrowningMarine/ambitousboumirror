@@ -41,6 +41,54 @@ const orderIdCache = new LRUCache<string, string>({
   ttl: 3600000, // 1 hour TTL
 });
 
+// Helper: Mode-aware status update
+async function updateStatusWithMode(
+  entryId: string,
+  status: TransactionStatus,
+  notes: string,
+  runningMode: 'auto' | 'appwrite' | 'supabase' | 'fallback'
+): Promise<void> {
+  try {
+    // AUTO MODE: Try Appwrite first, fallback to Supabase
+    if (runningMode === 'auto') {
+      try {
+        await updateBankTransactionEntryStatus(entryId, status, notes);
+      } catch (appwriteError) {
+        console.warn('🟡 [Auto Mode] Appwrite status update failed - trying Supabase', appwriteError);
+        const bankEntryService = new BankTransactionEntryService();
+        await bankEntryService.updateBankTransactionEntryStatus(
+          entryId,
+          status as 'pending' | 'processed' | 'available' | 'failed' | 'unlinked',
+          notes
+        );
+      }
+      return;
+    }
+    
+    // APPWRITE MODE: Only use Appwrite
+    if (runningMode === 'appwrite') {
+      console.log('🔵 [Appwrite Mode] Updating status in Appwrite only');
+      await updateBankTransactionEntryStatus(entryId, status, notes);
+      return;
+    }
+    
+    // SUPABASE MODE: Only use Supabase
+    if (runningMode === 'supabase') {
+      console.log('🟢 [Supabase Mode] Updating status in Supabase only');
+      const bankEntryService = new BankTransactionEntryService();
+      await bankEntryService.updateBankTransactionEntryStatus(
+        entryId,
+        status as 'pending' | 'processed' | 'available' | 'failed' | 'unlinked',
+        notes
+      );
+      return;
+    }
+  } catch (error) {
+    console.error(`[${runningMode} Mode] Status update failed:`, error);
+    // Don't throw - status update failures should not block webhook processing
+  }
+}
+
 // OPTIMIZATION: Enhanced circuit breaker for bulk operations with high-traffic resilience
 interface CircuitBreakerState {
   failures: number;
@@ -426,7 +474,7 @@ async function retryWithBackoff<T>(
   throw lastError;
 }
 
-// OPTIMIZATION: High-performance bank lookup with circuit breaker, retry logic, and bulk support
+// OPTIMIZATION: High-performance bank lookup with circuit breaker, retry logic, and automatic fallback
 async function findBankByAccountNumberOptimized(accountNumber: string, isBulkOperation = false) {
   const cacheKey = `bank:${accountNumber}`;
   const cached = bankLookupCache.get(cacheKey);
@@ -438,8 +486,8 @@ async function findBankByAccountNumberOptimized(accountNumber: string, isBulkOpe
 
   // Check circuit breaker before database operation
   if (isCircuitOpen('bank-lookup', isBulkOperation)) {
-    // If client-only mode is enabled and circuit is open, use fallback bank data
-    if (appConfig.useClientOnlyPayment && accountNumber === appConfig.fallbackBankData.accountNumber) {
+    // Circuit is open - use fallback bank data directly
+    if (accountNumber === appConfig.fallbackBankData.accountNumber) {
       console.warn(`⚠️ Circuit breaker open for bank lookup - using fallback bank data: ${accountNumber}`);
       
       const fallbackBank = {
@@ -490,38 +538,36 @@ async function findBankByAccountNumberOptimized(accountNumber: string, isBulkOpe
   } catch (error) {
     console.error('Error finding bank by account number:', error);
     
-    // If client-only mode is enabled, use fallback bank data
-    if (appConfig.useClientOnlyPayment) {
-      console.warn(`⚠️ Appwrite bank lookup failed - using fallback bank data for account: ${accountNumber}`);
+    // Automatic fallback: Use fallback bank data on any error
+    console.warn(`⚠️ Appwrite bank lookup failed - using fallback bank data for account: ${accountNumber}`);
+    
+    // Check if the account number matches fallback bank configuration
+    if (accountNumber === appConfig.fallbackBankData.accountNumber) {
+      const fallbackBank = {
+        $id: appConfig.fallbackBankData.bankId,
+        $collectionId: 'fallback',
+        $databaseId: 'fallback',
+        $createdAt: new Date().toISOString(),
+        $updatedAt: new Date().toISOString(),
+        $permissions: [],
+        bankId: appConfig.fallbackBankData.bankId,
+        bankName: appConfig.fallbackBankData.bankName,
+        bankBinCode: appConfig.fallbackBankData.bankBinCode,
+        accountNumber: appConfig.fallbackBankData.accountNumber,
+        ownerName: appConfig.fallbackBankData.ownerName,
+        isActivated: appConfig.fallbackBankData.isActivated,
+        minAmount: appConfig.fallbackBankData.minAmount,
+        maxAmount: appConfig.fallbackBankData.maxAmount,
+        availableBalance: appConfig.fallbackBankData.availableBalance,
+        currentBalance: appConfig.fallbackBankData.availableBalance
+      };
       
-      // Check if the account number matches fallback bank configuration
-      if (accountNumber === appConfig.fallbackBankData.accountNumber) {
-        const fallbackBank = {
-          $id: appConfig.fallbackBankData.bankId,
-          $collectionId: 'fallback',
-          $databaseId: 'fallback',
-          $createdAt: new Date().toISOString(),
-          $updatedAt: new Date().toISOString(),
-          $permissions: [],
-          bankId: appConfig.fallbackBankData.bankId,
-          bankName: appConfig.fallbackBankData.bankName,
-          bankBinCode: appConfig.fallbackBankData.bankBinCode,
-          accountNumber: appConfig.fallbackBankData.accountNumber,
-          ownerName: appConfig.fallbackBankData.ownerName,
-          isActivated: appConfig.fallbackBankData.isActivated,
-          minAmount: appConfig.fallbackBankData.minAmount,
-          maxAmount: appConfig.fallbackBankData.maxAmount,
-          availableBalance: appConfig.fallbackBankData.availableBalance,
-          currentBalance: appConfig.fallbackBankData.availableBalance
-        };
-        
-        const result = { success: true, bank: fallbackBank, message: '' };
-        bankLookupCache.set(cacheKey, result);
-        recordSuccess('bank-lookup', isBulkOperation);
-        return result;
-      } else {
-        console.warn(`⚠️ Account ${accountNumber} does not match fallback bank account ${appConfig.fallbackBankData.accountNumber}`);
-      }
+      const result = { success: true, bank: fallbackBank, message: '' };
+      bankLookupCache.set(cacheKey, result);
+      recordSuccess('bank-lookup', isBulkOperation);
+      return result;
+    } else {
+      console.warn(`⚠️ Account ${accountNumber} does not match fallback bank account ${appConfig.fallbackBankData.accountNumber}`);
     }
     
     // Determine if error is transient
@@ -725,68 +771,86 @@ async function processTransactionsBatch(
   return results;
 }
 
-// OPTIMIZATION: Enhanced race condition handling for webhook/order API timing issues
+// OPTIMIZATION: Enhanced race condition handling with mode-aware database selection
 async function processPaymentWithRaceConditionHandling(
   odrId: string, 
   amount: number, 
   bankAccountNumber: string,
-  bankInfo: Awaited<ReturnType<typeof findBankByAccountNumber>>['bank']
+  bankInfo: Awaited<ReturnType<typeof findBankByAccountNumber>>['bank'],
+  runningMode: 'auto' | 'appwrite' | 'supabase' | 'fallback'
 ): Promise<{ success: boolean; message?: string; data?: unknown; isOverpayment?: boolean }> {
   
-  // If client-only payment mode is enabled, check Supabase first
-  if (appConfig.useClientOnlyPayment) {
+  // SUPABASE MODE: Only use Supabase
+  if (runningMode === 'supabase') {
+    console.log('🟢 [Supabase Mode] Processing payment in Supabase only');
     try {
       const backupService = new BackupOrderService();
       const backupOrder = await backupService.getBackupOrder(odrId);
       
-      if (backupOrder) {
-        // Order found in Supabase - update it directly
-        const currentPaidAmount = backupOrder.paid_amount || 0;
-        const newPaidAmount = currentPaidAmount + amount;
-        const unpaidAmount = Math.max(0, backupOrder.amount - newPaidAmount);
-        const isFullyPaid = unpaidAmount === 0;
-        const isOverpayment = newPaidAmount > backupOrder.amount;
-        
-        const newStatus = isFullyPaid ? 'completed' : 'processing';
-        await backupService.updateOrderStatus(odrId, newStatus, newPaidAmount);
-        
-        await log.info('Payment processed for Supabase order', {
-          odrId,
-          amount,
-          previousPaid: currentPaidAmount,
-          newPaid: newPaidAmount,
-          unpaid: unpaidAmount,
-          status: newStatus,
-          mode: 'client-only'
-        });
-        
-        // NOTE: Order only exists in Supabase, not in Appwrite
-        // Client-only payment page will subscribe to Supabase realtime for updates
-        
+      if (!backupOrder) {
         return {
-          success: true,
-          message: 'Payment processed successfully in Supabase',
-          isOverpayment,
-          data: { odrId, paidAmount: newPaidAmount, status: newStatus }
+          success: false,
+          message: 'Order not found in Supabase'
         };
       }
       
-      // Order not found in Supabase, fall through to Appwrite check
-      await log.warn('Order not found in Supabase, checking Appwrite', {
+      const currentPaidAmount = backupOrder.paid_amount || 0;
+      const newPaidAmount = currentPaidAmount + amount;
+      const unpaidAmount = Math.max(0, backupOrder.amount - newPaidAmount);
+      const isFullyPaid = unpaidAmount === 0;
+      const isOverpayment = newPaidAmount > backupOrder.amount;
+      
+      const newStatus = isFullyPaid ? 'completed' : 'processing';
+      await backupService.updateOrderStatus(odrId, newStatus, newPaidAmount);
+      
+      await log.info('🟢 [Supabase Mode] Payment processed in Supabase', {
         odrId,
         amount,
-        mode: 'client-only'
+        previousPaid: currentPaidAmount,
+        newPaid: newPaidAmount,
+        unpaid: unpaidAmount,
+        status: newStatus
       });
+      
+      return {
+        success: true,
+        message: 'Payment processed successfully in Supabase',
+        isOverpayment,
+        data: { odrId, paidAmount: newPaidAmount, status: newStatus }
+      };
     } catch (error) {
-      await log.error('Error checking Supabase for order', error instanceof Error ? error : new Error(String(error)), {
+      await log.error('🟢 [Supabase Mode] Payment processing failed', error instanceof Error ? error : new Error(String(error)), {
         odrId,
         amount
       });
-      // Fall through to Appwrite check on error
+      return {
+        success: false,
+        message: `Supabase payment processing failed: ${error instanceof Error ? error.message : 'Unknown error'}`
+      };
     }
   }
   
-  // Standard Appwrite processing (normal mode or fallback)
+  // APPWRITE MODE: Only use Appwrite, no fallback
+  if (runningMode === 'appwrite') {
+    console.log('🔵 [Appwrite Mode] Processing payment in Appwrite only');
+    let result = await proccessTransactionPayment(odrId, amount);
+    
+    // Retry logic for race conditions with order creation API
+    if (!result.success && result.message?.includes('not found')) {
+      await new Promise(resolve => setTimeout(resolve, 150));
+      result = await proccessTransactionPayment(odrId, amount);
+      
+      if (!result.success && result.message?.includes('not found')) {
+        await new Promise(resolve => setTimeout(resolve, 350));
+        result = await proccessTransactionPayment(odrId, amount);
+      }
+    }
+    
+    return result;
+  }
+  
+  // AUTO MODE: Try Appwrite first, fallback to Supabase
+  console.log('🟡 [Auto Mode] Processing payment - Appwrite first, Supabase fallback');
   let result = await proccessTransactionPayment(odrId, amount);
   
   // If order not found, implement retry logic for race condition with order creation API
@@ -802,40 +866,79 @@ async function processPaymentWithRaceConditionHandling(
       
       result = await proccessTransactionPayment(odrId, amount);
       
-      // If STILL not found and client-only payment mode is enabled, create order retroactively
-      if (!result.success && result.message?.includes('not found') && appConfig.useClientOnlyPayment && bankInfo) {
-        await log.warn('Order not found after retries - creating retroactively', {
+      // If STILL not found in Appwrite, try Supabase backup (automatic fallback)
+      if (!result.success && result.message?.includes('not found')) {
+        await log.warn('🟡 [Auto Mode] Order not found in Appwrite after retries - trying Supabase backup', {
           odrId,
           amount,
-          bankAccountNumber,
-          feature: 'clientOnlyPayment'
+          bankAccountNumber
         });
         
         try {
-          // Create retroactive order
-          const retroResult = await createRetroactiveOrder(odrId, amount, bankInfo);
+          const backupService = new BackupOrderService();
+          const backupOrder = await backupService.getBackupOrder(odrId);
           
-          if (retroResult.success) {
-            await log.info('Retroactive order created successfully', {
+          if (backupOrder) {
+            // Order found in Supabase - update it directly
+            const currentPaidAmount = backupOrder.paid_amount || 0;
+            const newPaidAmount = currentPaidAmount + amount;
+            const unpaidAmount = Math.max(0, backupOrder.amount - newPaidAmount);
+            const isFullyPaid = unpaidAmount === 0;
+            const isOverpayment = newPaidAmount > backupOrder.amount;
+            
+            const newStatus = isFullyPaid ? 'completed' : 'processing';
+            await backupService.updateOrderStatus(odrId, newStatus, newPaidAmount);
+            
+            await log.info('🟡 [Auto Mode] Payment processed in Supabase (fallback)', {
               odrId,
               amount,
-              merchantId: retroResult.merchantId
+              previousPaid: currentPaidAmount,
+              newPaid: newPaidAmount,
+              unpaid: unpaidAmount,
+              status: newStatus
             });
             
-            // Try processing payment one more time
-            result = await proccessTransactionPayment(odrId, amount);
-          } else {
-            await log.error('Failed to create retroactive order', new Error(retroResult.message || 'Unknown error'), {
+            return {
+              success: true,
+              message: 'Payment processed successfully in Supabase backup',
+              isOverpayment,
+              data: { odrId, paidAmount: newPaidAmount, status: newStatus }
+            };
+          }
+          
+          // Order not found in Supabase either - try creating retroactively if bank info available
+          if (bankInfo) {
+            await log.warn('🟡 [Auto Mode] Order not found in both databases - creating retroactively', {
               odrId,
               amount,
               bankAccountNumber
             });
+            
+            const retroResult = await createRetroactiveOrder(odrId, amount, bankInfo);
+            
+            if (retroResult.success) {
+              await log.info('🟡 [Auto Mode] Retroactive order created successfully', {
+                odrId,
+                amount,
+                merchantId: retroResult.merchantId
+              });
+              
+              // Try processing payment one more time
+              result = await proccessTransactionPayment(odrId, amount);
+              return result;
+            } else {
+              await log.error('🟡 [Auto Mode] Failed to create retroactive order', new Error(retroResult.message || 'Unknown error'), {
+                odrId,
+                amount,
+                bankAccountNumber
+              });
+            }
           }
+          
         } catch (error) {
-          await log.error('Error creating retroactive order', error instanceof Error ? error : new Error(String(error)), {
+          await log.error('🟡 [Auto Mode] Error checking Supabase backup', error instanceof Error ? error : new Error(String(error)), {
             odrId,
-            amount,
-            bankAccountNumber
+            amount
           });
         }
       }
@@ -1028,6 +1131,10 @@ async function processUniversalTransaction(
   const txStartTime = performance.now();
   
   try {
+    // Phase 0: Check database mode configuration
+    const { getCoreRunningMode } = await import('@/lib/appconfig');
+    const runningMode = getCoreRunningMode();
+    
     // Phase 1: Data validation and normalization
     const validationStart = performance.now();
     const normalizedTx = normalizeTransaction(transaction, portal);
@@ -1105,6 +1212,57 @@ async function processUniversalTransaction(
       };
     }
 
+    // FALLBACK MODE: Try to get cached webhook data, then skip database operations
+    if (runningMode === 'fallback') {
+      console.log('🟡 [Webhook Fallback Mode] Transaction received but not saved to database:', {
+        portal,
+        txId: normalizedTx.id,
+        odrId: odrId || 'UNKNOWN',
+        amount: normalizedTx.amount,
+        accountNumber: normalizedTx.accountNumber,
+        description: normalizedTx.description.substring(0, 100)
+      });
+      
+      // TRY: Get cached webhook data for merchant notification
+      let cachedWebhookData = null;
+      if (odrId) {
+        try {
+          const { getFallbackWebhookData } = await import('@/lib/cache/webhook-fallback-cache');
+          cachedWebhookData = await getFallbackWebhookData(odrId);
+          
+          if (cachedWebhookData) {
+            console.log('✅ [Fallback Mode] Found cached webhook data - will send merchant notification');
+          } else {
+            console.warn('⚠️ [Fallback Mode] No cached webhook data - merchant notification cannot be sent');
+          }
+        } catch (error) {
+          console.error('❌ [Fallback Mode] Error accessing webhook cache:', error);
+        }
+      }
+      
+      processingMetrics.total = performance.now() - txStartTime;
+      return {
+        id: normalizedTx.id,
+        status: 'processed',
+        bankId: bankResult.bank.bankId,
+        odrId: odrId || null,
+        amount: normalizedTx.amount,
+        // Include cached data if available
+        url_callback: cachedWebhookData?.urlCallback,
+        merchantOrdId: cachedWebhookData?.merchantOrdId,
+        orderType: cachedWebhookData?.orderType,
+        odrStatus: 'processing', // In fallback, we assume processing
+        bankReceiveNumber: cachedWebhookData?.bankReceiveNumber || cachedWebhookData?.accountNumber,
+        bankReceiveOwnerName: cachedWebhookData?.bankReceiveOwnerName || cachedWebhookData?.accountName,
+        paidAmount: Math.abs(normalizedTx.amount),
+        apiKey: cachedWebhookData?.apiKey,
+        message: cachedWebhookData 
+          ? 'Fallback mode - using cached data for merchant notification'
+          : 'Fallback mode - no cached data, merchant notification skipped',
+        metrics: processingMetrics
+      };
+    }
+
     // Phase 3 & 4: OPTIMIZED - Run createEntry, bankUpdate, and payment in PARALLEL
     // This is the KEY performance improvement - no more waiting!
     const parallelStart = performance.now();
@@ -1159,64 +1317,117 @@ async function processUniversalTransaction(
       ]);
     };
 
-    // IMPROVEMENT: PARALLEL EXECUTION with retry logic - Run all 3 operations at once (MAJOR PERFORMANCE BOOST)
-    // In client-only mode, we save bank entry to Supabase and only process Supabase order
-    const [entryResult_settled, bankUpdateResult, paymentResult] = appConfig.useClientOnlyPayment
-      ? await Promise.allSettled([
-          // Save bank entry to Supabase backup
-          withTimeout(
-            (async () => {
-              const bankEntryService = new BankTransactionEntryService();
-              const result = await bankEntryService.createBankTransactionEntry({
-                portal_id: portal,
-                portal_transaction_id: portalTransactionId,
-                odr_id: odrId || 'UNKNOWN',
-                bank_id: bankResult.bank?.$id,
-                bank_name: bankResult.bank?.bankName || normalizedTx.bankName || '',
-                bank_account_number: normalizedTx.accountNumber,
-                amount: Math.floor(normalizedTx.amount),
-                transaction_type: transactionType,
-                balance_after: Math.floor(normalizedTx.balance),
-                status: 'pending',
-                notes: 'Client-only mode - saved to Supabase'
-              });
-              return { 
-                success: result.success, 
-                entry: result.id ? { $id: result.id } : null,
-                message: result.error
-              };
-            })(),
-            OPERATION_TIMEOUT
-          ),
-          // Skip bank balance update (Appwrite unavailable)
-          Promise.resolve({ success: true }),
-          // Only process Supabase order payment
-          odrId && Math.abs(normalizedTx.amount) > 0 
-            ? withTimeout(
-                processPaymentWithRaceConditionHandling(
-                  odrId, 
-                  Math.abs(normalizedTx.amount),
-                  normalizedTx.accountNumber,
-                  bankResult.bank
-                ),
-                OPERATION_TIMEOUT
-              )
-            : Promise.resolve({ success: false, message: 'No valid order ID or amount' })
-        ])
-      : await Promise.allSettled([
-          // 1. Create entry with retry logic for transient failures
-          withTimeout(
-            retryWithBackoff(
+    // IMPROVEMENT: PARALLEL EXECUTION with mode-aware database selection
+    // Routes to appropriate database based on coreRunningMode config
+    const [entryResult_settled, bankUpdateResult, paymentResult] = await Promise.allSettled([
+      // 1. Create entry with mode-aware database selection
+      withTimeout(
+        (async () => {
+          // AUTO MODE: Try Appwrite first, fallback to Supabase on error
+          if (runningMode === 'auto') {
+            try {
+              return await retryWithBackoff(
+                () => createBankTransactionEntry(bankTransactionData),
+                3,
+                150,
+                `create-entry-${portalTransactionId}`
+              );
+            } catch (appwriteError) {
+              console.warn('🟡 [Auto Mode] Appwrite entry creation failed - using Supabase backup');
+              try {
+                const bankEntryService = new BankTransactionEntryService();
+                const result = await bankEntryService.createBankTransactionEntry({
+                  portal_id: portal,
+                  portal_transaction_id: portalTransactionId,
+                  odr_id: odrId || 'UNKNOWN',
+                  bank_id: bankResult.bank?.$id,
+                  bank_name: bankResult.bank?.bankName || normalizedTx.bankName || '',
+                  bank_account_number: normalizedTx.accountNumber,
+                  amount: Math.floor(normalizedTx.amount),
+                  transaction_type: transactionType,
+                  balance_after: Math.floor(normalizedTx.balance),
+                  status: 'pending',
+                  notes: 'Supabase fallback - Appwrite unavailable'
+                });
+                return { 
+                  success: result.success, 
+                  entry: result.id ? { $id: result.id } : null,
+                  message: result.error
+                };
+              } catch {
+                console.error('❌ [Auto Mode] Both Appwrite and Supabase entry creation failed');
+                throw appwriteError;
+              }
+            }
+          }
+          
+          // APPWRITE MODE: Only use Appwrite, fail if unavailable
+          if (runningMode === 'appwrite') {
+            console.log('🔵 [Appwrite Mode] Creating entry in Appwrite only');
+            return await retryWithBackoff(
               () => createBankTransactionEntry(bankTransactionData),
               3,
               150,
               `create-entry-${portalTransactionId}`
-            ),
-            OPERATION_TIMEOUT
-          ),
-          // 2. Update bank balance with retry logic
-          withTimeout(
-            retryWithBackoff(
+            );
+          }
+          
+          // SUPABASE MODE: Only use Supabase, fail if unavailable
+          if (runningMode === 'supabase') {
+            console.log('🟢 [Supabase Mode] Creating entry in Supabase only');
+            const bankEntryService = new BankTransactionEntryService();
+            const result = await bankEntryService.createBankTransactionEntry({
+              portal_id: portal,
+              portal_transaction_id: portalTransactionId,
+              odr_id: odrId || 'UNKNOWN',
+              bank_id: bankResult.bank?.$id,
+              bank_name: bankResult.bank?.bankName || normalizedTx.bankName || '',
+              bank_account_number: normalizedTx.accountNumber,
+              amount: Math.floor(normalizedTx.amount),
+              transaction_type: transactionType,
+              balance_after: Math.floor(normalizedTx.balance),
+              status: 'pending',
+              notes: 'Supabase only mode'
+            });
+            return { 
+              success: result.success, 
+              entry: result.id ? { $id: result.id } : null,
+              message: result.error
+            };
+          }
+          
+          throw new Error(`Unknown running mode: ${runningMode}`);
+        })(),
+        OPERATION_TIMEOUT
+      ),
+      // 2. Update bank balance with mode-aware database selection
+      withTimeout(
+        (async () => {
+          // AUTO MODE: Try Appwrite first, log warning on error
+          if (runningMode === 'auto') {
+            try {
+              return await retryWithBackoff(
+                () => updateBankBalance(
+                  bankResult.bank!.bankId,
+                  Math.abs(Math.floor(normalizedTx.amount)),
+                  true,
+                  true,
+                  Math.floor(normalizedTx.amount) >= 0
+                ),
+                3,
+                150,
+                `update-balance-${bankResult.bank!.bankId}`
+              );
+            } catch {
+              console.warn('🟡 [Auto Mode] Appwrite balance update failed - will sync on next availability');
+              return { success: true, message: 'Balance update deferred' };
+            }
+          }
+          
+          // APPWRITE MODE: Only use Appwrite
+          if (runningMode === 'appwrite') {
+            console.log('🔵 [Appwrite Mode] Updating balance in Appwrite only');
+            return await retryWithBackoff(
               () => updateBankBalance(
                 bankResult.bank!.bankId,
                 Math.abs(Math.floor(normalizedTx.amount)),
@@ -1227,22 +1438,33 @@ async function processUniversalTransaction(
               3,
               150,
               `update-balance-${bankResult.bank!.bankId}`
+            );
+          }
+          
+          // SUPABASE MODE: Supabase balance updates not yet implemented
+          if (runningMode === 'supabase') {
+            console.warn('🟢 [Supabase Mode] Balance update not yet implemented - will sync later');
+            return { success: true, message: 'Supabase balance update deferred' };
+          }
+          
+          throw new Error(`Unknown running mode: ${runningMode}`);
+        })(),
+        OPERATION_TIMEOUT
+      ),
+      // 3. Process payment (if valid order) with mode-aware database selection
+      odrId && Math.abs(normalizedTx.amount) > 0 
+        ? withTimeout(
+            processPaymentWithRaceConditionHandling(
+              odrId, 
+              Math.abs(normalizedTx.amount),
+              normalizedTx.accountNumber,
+              bankResult.bank,
+              runningMode
             ),
             OPERATION_TIMEOUT
-          ),
-          // 3. Process payment (if valid order) - already has retry logic in processPaymentWithRaceConditionHandling
-          odrId && Math.abs(normalizedTx.amount) > 0 
-            ? withTimeout(
-                processPaymentWithRaceConditionHandling(
-                  odrId, 
-                  Math.abs(normalizedTx.amount),
-                  normalizedTx.accountNumber,
-                  bankResult.bank
-                ),
-                OPERATION_TIMEOUT
-              )
-            : Promise.resolve({ success: false, message: 'No valid order ID or amount' })
-        ]);
+          )
+        : Promise.resolve({ success: false, message: 'No valid order ID or amount' })
+    ]);
 
     const parallelEnd = performance.now();
     processingMetrics.entryCreation = parallelEnd - parallelStart; // All 3 operations together
@@ -1261,21 +1483,11 @@ async function processUniversalTransaction(
       ? paymentResult.value 
       : { success: false, message: 'Payment processing failed' };
 
-    // DEBUG: Log results in client-only mode
-    if (appConfig.useClientOnlyPayment) {
-      console.log('🔍 Client-only mode results:', {
-        txId: normalizedTx.id,
-        odrId,
-        entryResult: { success: entryResult.success, hasEntry: !!entryResult.entry },
-        bankResult: { success: bankResult_final.success },
-        paymentResult: { success: paymentResult_final.success, message: paymentResult_final.message }
-      });
-    }
-
-    // Validate bank entry creation (skip validation in client-only mode since we're using Supabase)
-    if (!appConfig.useClientOnlyPayment && (!entryResult.success || !entryResult.entry)) {
-      // IMPORTANT: On error, update entry with error details for debugging
-      // Note: rawPayload is empty, but error message provides context
+    // Validate bank entry creation
+    // NOTE: Entry creation failure should not fail the transaction if payment succeeds
+    // Entry is for logging/tracking
+    if (!entryResult.success && !paymentResult_final.success) {
+      // Both entry and payment failed - return error
       processingMetrics.total = performance.now() - txStartTime;
       const errorMessage = 'message' in entryResult ? entryResult.message : 'Failed to create transaction entry';
       return {
@@ -1285,31 +1497,15 @@ async function processUniversalTransaction(
         metrics: processingMetrics
       };
     }
-
-    // Also check Supabase entry creation in client-only mode
-    // NOTE: In client-only mode, entry creation failure (e.g., duplicate) should not fail the transaction
-    // if payment processing succeeds. Entry is just for logging/tracking.
-    if (appConfig.useClientOnlyPayment && !entryResult.success) {
-      // If entry creation failed but payment succeeded, continue with success
-      if (paymentResult_final.success) {
-        await log.warn('Bank entry creation failed but payment succeeded (client-only mode)', {
-          txId: normalizedTx.id,
-          odrId,
-          entryError: entryResult.message || 'Unknown error',
-          paymentSuccess: true
-        });
-        // Continue processing - don't return failed
-      } else {
-        // Both entry and payment failed - return error
-        processingMetrics.total = performance.now() - txStartTime;
-        const errorMessage = 'message' in entryResult ? entryResult.message : 'Failed to create transaction entry in Supabase';
-        return {
-          id: normalizedTx.id,
-          status: 'failed',
-          message: errorMessage || 'Failed to create transaction entry in Supabase',
-          metrics: processingMetrics
-        };
-      }
+    
+    // If entry creation failed but payment succeeded, log warning but continue
+    if (!entryResult.success && paymentResult_final.success) {
+      await log.warn('Bank entry creation failed but payment succeeded', {
+        txId: normalizedTx.id,
+        odrId,
+        entryError: entryResult.message || 'Unknown error',
+        paymentSuccess: true
+      });
     }
 
     let finalStatus: TransactionStatus = 'pending';
@@ -1319,29 +1515,13 @@ async function processUniversalTransaction(
     if (!odrId) {
       const statusUpdateStart = performance.now();
       finalStatus = 'unlinked' as TransactionStatus;
-      finalNotes = appConfig.useClientOnlyPayment 
-        ? 'Transaction without order ID - client-only mode'
-        : 'Transaction recorded without order ID';
+      finalNotes = 'Transaction recorded without order ID';
 
       // Update status in background for transactions without order ID
       if (entryResult.entry) {
-        if (appConfig.useClientOnlyPayment) {
-          // Update in Supabase
-          const bankEntryService = new BankTransactionEntryService();
-          bankEntryService.updateBankTransactionEntryStatus(
-            entryResult.entry.$id, 
-            finalStatus as 'pending' | 'processed' | 'available' | 'failed' | 'unlinked', 
-            finalNotes
-          ).catch(updateError => {
-              console.error('Supabase status update error for transaction:', normalizedTx.id, updateError);
-            });
-        } else {
-          // Update in Appwrite
-          updateBankTransactionEntryStatus(entryResult.entry.$id, finalStatus, finalNotes)
-            .catch(updateError => {
-              console.error('Status update error for transaction:', normalizedTx.id, updateError);
-            });
-        }
+        const entryId = entryResult.entry.$id;
+        updateStatusWithMode(entryId, finalStatus, finalNotes, runningMode)
+          .catch(error => console.error('Status update failed:', error));
       }
       processingMetrics.statusUpdate = performance.now() - statusUpdateStart;
       processingMetrics.total = performance.now() - txStartTime;
@@ -1361,8 +1541,7 @@ async function processUniversalTransaction(
     const isOrderFullyPaid = paymentResult_final.success && 'isOverpayment' in paymentResult_final && Boolean(paymentResult_final.isOverpayment);
 
     // Determine final status based on results and overpayment status
-    // In client-only mode, bank operations are skipped, so we only check payment result
-    if (!appConfig.useClientOnlyPayment && !bankResult_final.success) {
+    if (!bankResult_final.success) {
       finalStatus = 'failed';
       const bankMessage = 'message' in bankResult_final ? bankResult_final.message : 'Unknown error';
       finalNotes = `Failed to update bank balance: ${bankMessage} | TxID: ${normalizedTx.id}`;
@@ -1371,51 +1550,36 @@ async function processUniversalTransaction(
     } else if (isOrderFullyPaid) {
       // Order is already fully paid - mark as available for redemption
       finalStatus = 'available' as TransactionStatus;
-      if (!appConfig.useClientOnlyPayment && 'previousBalance' in bankResult_final && 'newBalance' in bankResult_final) {
+      if ('previousBalance' in bankResult_final && 'newBalance' in bankResult_final) {
         const prevBalance = (bankResult_final.previousBalance as { current?: number })?.current;
         const newBalance = (bankResult_final.newBalance as { current?: number })?.current;
         finalNotes = `Bank balance updated successfully. Previous: ${prevBalance}, New: ${newBalance} | Order already fully paid, marked as available for redemption`;
       } else {
-        finalNotes = `Order already fully paid (client-only mode)`;
+        finalNotes = `Order already fully paid (fallback mode)`;
       }
       
       // OPTIMIZATION: Move order details lookup to background (non-blocking)
       if (entryResult.entry) {
-        if (appConfig.useClientOnlyPayment) {
-          // Update in Supabase
-          const bankEntryService = new BankTransactionEntryService();
-          getTransactionByOrderId(odrId)
-            .then(orderDetails => {
-              if (orderDetails) {
-                const enhancedNotes = finalNotes + ` | Original order type: ${orderDetails.odrType}`;
-                bankEntryService.updateBankTransactionEntryStatus(entryResult.entry!.$id, finalStatus as 'available', enhancedNotes)
-                  .catch(error => console.error('Supabase background order details update error:', error));
-              }
-            })
-            .catch(error => console.error('Background order details lookup error:', error));
-        } else {
-          // Update in Appwrite
-          getTransactionByOrderId(odrId)
-            .then(orderDetails => {
-              if (orderDetails) {
-                const enhancedNotes = finalNotes + ` | Original order type: ${orderDetails.odrType}`;
-                updateBankTransactionEntryStatus(entryResult.entry!.$id, finalStatus, enhancedNotes)
-                  .catch(error => console.error('Background order details update error:', error));
-              }
-            })
-            .catch(error => console.error('Background order details lookup error:', error));
-        }
+        getTransactionByOrderId(odrId)
+          .then(orderDetails => {
+            if (orderDetails && entryResult.entry) {
+              const enhancedNotes = finalNotes + ` | Original order type: ${orderDetails.odrType}`;
+              updateStatusWithMode(entryResult.entry.$id, finalStatus, enhancedNotes, runningMode)
+                .catch(error => console.error('Background status update failed:', error));
+            }
+          })
+          .catch(error => console.error('Background order details lookup error:', error));
       }
     } else {
       // Normal processing - bank updated and payment processed
       finalStatus = paymentResult_final.success ? 'processed' : 'failed';
       
-      if (!appConfig.useClientOnlyPayment && 'previousBalance' in bankResult_final && 'newBalance' in bankResult_final) {
+      if ('previousBalance' in bankResult_final && 'newBalance' in bankResult_final) {
         const prevBalance = (bankResult_final.previousBalance as { current?: number })?.current;
         const newBalance = (bankResult_final.newBalance as { current?: number })?.current;
         finalNotes = `Bank balance updated. Previous: ${prevBalance}, New: ${newBalance}`;
       } else {
-        finalNotes = `Payment processed (client-only mode)`;
+        finalNotes = `Payment processed (fallback mode)`;
       }
       
       if (paymentResult_final.success) {
@@ -1428,28 +1592,13 @@ async function processUniversalTransaction(
     // Phase 5: Update status in background to avoid blocking webhook response
     const statusUpdateStart = performance.now();
     if (entryResult.entry) {
-      if (appConfig.useClientOnlyPayment) {
-        // Update in Supabase
-        const bankEntryService = new BankTransactionEntryService();
-        bankEntryService.updateBankTransactionEntryStatus(
-          entryResult.entry.$id, 
-          finalStatus as 'pending' | 'processed' | 'available' | 'failed' | 'unlinked', 
-          finalNotes
-        ).catch(updateError => {
-          console.error('Supabase status update error for transaction:', normalizedTx.id, updateError);
-        });
-      } else {
-        // Update in Appwrite
-        updateBankTransactionEntryStatus(entryResult.entry.$id, finalStatus, finalNotes)
-          .catch(updateError => {
-            console.error('Status update error for transaction:', normalizedTx.id, updateError);
-          });
-      }
+      updateStatusWithMode(entryResult.entry.$id, finalStatus, finalNotes, runningMode)
+        .catch(error => console.error('Status update failed:', error));
     }
     processingMetrics.statusUpdate = performance.now() - statusUpdateStart;
     processingMetrics.total = performance.now() - txStartTime;
 
-    // Fetch url_callback and additional order details if in client-only mode and odrId exists
+    // Fetch url_callback and additional order details from appropriate database
     let urlCallback: string | undefined;
     let merchantOrdId: string | undefined;
     let orderType: 'deposit' | 'withdraw' | undefined;
@@ -1457,29 +1606,120 @@ async function processUniversalTransaction(
     let bankReceiveNumber: string | undefined;
     let bankReceiveOwnerName: string | undefined;
     let paidAmount: number | undefined;
+    let apiKey: string | undefined;
 
-    if (appConfig.useClientOnlyPayment && odrId) {
+    // Fetch order details based on running mode (for webhook callbacks)
+    if (odrId) {
       try {
-        const backupOrderService = new BackupOrderService();
-        const order = await backupOrderService.getBackupOrder(odrId);
-        if (order) {
-          urlCallback = order.url_callback || undefined;
-          merchantOrdId = order.merchant_odr_id || undefined;
-          orderType = order.odr_type;
-          odrStatus = order.odr_status;
-          paidAmount = order.paid_amount || undefined;
-
-          // Bank receive number - use account_number for deposit, bank_receive_number for withdraw
-          if (order.odr_type === 'deposit') {
-            bankReceiveNumber = order.account_number || undefined;
-            bankReceiveOwnerName = order.account_name || undefined;
-          } else if (order.odr_type === 'withdraw') {
-            bankReceiveNumber = order.bank_receive_number || undefined;
-            bankReceiveOwnerName = order.bank_receive_owner_name || undefined;
+        // APPWRITE MODE or AUTO MODE: Try Appwrite first
+        if (runningMode === 'appwrite' || runningMode === 'auto') {
+          try {
+            const { getTransactionByOrderId } = await import('@/lib/actions/transaction.actions');
+            const transaction = await getTransactionByOrderId(odrId);
+            
+            if (transaction) {
+              urlCallback = transaction.urlCallBack || undefined;
+              merchantOrdId = transaction.merchantOrdId || undefined;
+              orderType = transaction.odrType;
+              odrStatus = transaction.odrStatus;
+              paidAmount = transaction.paidAmount || undefined;
+              
+              // Get merchant API key from account object (if populated)
+              if (transaction.account && typeof transaction.account === 'object' && 'apiKey' in transaction.account) {
+                apiKey = transaction.account.apiKey || undefined;
+              }
+              
+              // Bank receive number based on transaction type
+              if (transaction.odrType === 'deposit') {
+                bankReceiveNumber = transaction.accountNumber || undefined;
+                bankReceiveOwnerName = transaction.accountName || undefined;
+              } else if (transaction.odrType === 'withdraw') {
+                bankReceiveNumber = transaction.bankReceiveNumber || undefined;
+                bankReceiveOwnerName = transaction.bankReceiveOwnerName || undefined;
+              }
+            } else if (runningMode === 'auto') {
+              // AUTO MODE: Fallback to Supabase if not found in Appwrite
+              throw new Error('Transaction not found in Appwrite - trying Supabase');
+            }
+          } catch (appwriteError) {
+            // AUTO MODE: Try Supabase backup if Appwrite fails
+            if (runningMode === 'auto') {
+              console.warn('🟡 [Auto Mode] Appwrite order fetch failed - trying Supabase backup');
+              const backupOrderService = new BackupOrderService();
+              const order = await backupOrderService.getBackupOrder(odrId);
+              
+              if (order) {
+                urlCallback = order.url_callback || undefined;
+                merchantOrdId = order.merchant_odr_id || undefined;
+                orderType = order.odr_type;
+                odrStatus = order.odr_status;
+                paidAmount = order.paid_amount || undefined;
+                
+                // Get merchant API key for webhook authentication
+                if (order.merchant_id) {
+                  try {
+                    const { MerchantAccountCacheService } = await import('@/lib/supabase-backup');
+                    const merchantCache = new MerchantAccountCacheService();
+                    const cachedMerchant = await merchantCache.getMerchantByApiKey('', order.merchant_id);
+                    apiKey = cachedMerchant?.api_key || undefined;
+                  } catch {
+                    // Silently fail - webhook will work without API key
+                  }
+                }
+                
+                // Bank receive number based on order type
+                if (order.odr_type === 'deposit') {
+                  bankReceiveNumber = order.account_number || undefined;
+                  bankReceiveOwnerName = order.account_name || undefined;
+                } else if (order.odr_type === 'withdraw') {
+                  bankReceiveNumber = order.bank_receive_number || undefined;
+                  bankReceiveOwnerName = order.bank_receive_owner_name || undefined;
+                }
+              }
+            } else {
+              // APPWRITE MODE: Don't fallback, just log error
+              console.error('🔵 [Appwrite Mode] Failed to fetch order details:', appwriteError);
+            }
           }
         }
-      } catch {
+        
+        // SUPABASE MODE: Only use Supabase backup
+        if (runningMode === 'supabase') {
+          const backupOrderService = new BackupOrderService();
+          const order = await backupOrderService.getBackupOrder(odrId);
+          
+          if (order) {
+            urlCallback = order.url_callback || undefined;
+            merchantOrdId = order.merchant_odr_id || undefined;
+            orderType = order.odr_type;
+            odrStatus = order.odr_status;
+            paidAmount = order.paid_amount || undefined;
+            
+            // Get merchant API key for webhook authentication
+            if (order.merchant_id) {
+              try {
+                const { MerchantAccountCacheService } = await import('@/lib/supabase-backup');
+                const merchantCache = new MerchantAccountCacheService();
+                const cachedMerchant = await merchantCache.getMerchantByApiKey('', order.merchant_id);
+                apiKey = cachedMerchant?.api_key || undefined;
+              } catch {
+                // Silently fail - webhook will work without API key
+              }
+            }
+            
+            // Bank receive number based on order type
+            if (order.odr_type === 'deposit') {
+              bankReceiveNumber = order.account_number || undefined;
+              bankReceiveOwnerName = order.account_name || undefined;
+            } else if (order.odr_type === 'withdraw') {
+              bankReceiveNumber = order.bank_receive_number || undefined;
+              bankReceiveOwnerName = order.bank_receive_owner_name || undefined;
+            }
+          }
+        }
+      } catch (error) {
         // Silently fail - these fields are optional
+        console.error('Error fetching order details for webhook:', error);
       }
     }
 
@@ -1496,6 +1736,7 @@ async function processUniversalTransaction(
       bankReceiveNumber,
       bankReceiveOwnerName,
       paidAmount,
+      apiKey, // For bulk webhook authentication
       message: `Transaction ${finalStatus === 'processed' ? 'processed successfully' : 
                 finalStatus === 'available' ? 'recorded as available for redemption' : 'failed'}`,
       metrics: processingMetrics
@@ -1968,8 +2209,15 @@ export async function POST(
         const secretAgentFailureCount = secretAgentResults.filter(r => r.status === 'failed').length;
         updatePortalMetrics(portal, performanceMetrics.total, secretAgentFailureCount === 0);
 
-        // Determine processing mode
+        // Determine processing mode (SecretAgent sends separate requests, not batched)
         const secretAgentProcessingMode = secretAgentPayloadParsed.length > 1 ? 'bulk' : 'single';
+        
+        // Log if receiving multiple separate requests vs true bulk
+        if (secretAgentPayloadParsed.length === 1) {
+          console.log('📦 [SecretAgent] Single transaction in array format (separate webhook request)');
+        } else {
+          console.log(`📦 [SecretAgent] True bulk: ${secretAgentPayloadParsed.length} transactions in one request`);
+        }
 
         // Return unified response with automatic logging
         return await createWebhookResponse({

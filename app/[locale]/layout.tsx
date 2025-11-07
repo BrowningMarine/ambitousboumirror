@@ -1,5 +1,5 @@
 import { NextIntlClientProvider } from "next-intl";
-import { ThemeProvider } from "@/lib/theme-provider";
+import { ThemeProvider } from "@/components/theme-provider";
 import { Toaster as ShadcnToaster } from "@/components/ui/toaster";
 import { Toaster } from "sonner";
 import { notFound } from "next/navigation";
@@ -7,7 +7,7 @@ import { appConfig } from "@/lib/appconfig";
 import OneSignalSetup from "@/components/OneSignalSetup";
 
 //const locales = ["en", "zh", "vn"];
-const locales = appConfig.locales
+const locales = appConfig.locales;
 
 export default async function LocaleLayout({
   children,
