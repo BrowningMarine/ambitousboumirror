@@ -106,6 +106,9 @@ let configCache: AppConfigJson | null = configData as AppConfigJson;
 let lastLoadTime = Date.now();
 const CACHE_TTL = 5000; // 5 seconds cache
 
+// Track if we've attempted initial blob load
+let initialBlobLoadAttempted = false;
+
 // Storage mode detection
 function getStorageMode(): 'local' | 'blob' | 'env' {
   const mode = process.env.CONFIG_STORAGE_MODE;
@@ -132,18 +135,19 @@ function isNodeEnvironment(): boolean {
 /**
  * Load configuration with smart caching
  * - In Edge Runtime: Always uses static JSON import (cannot reload)
- * - In Node.js: Can dynamically reload from storage based on mode
+ * - In Node.js Blob mode: Triggers async refresh, returns cache
+ * - In Node.js Local/Env mode: Loads synchronously
  * - Uses 5-second cache to reduce reads
  */
 export function loadAppConfig(forceReload = false): AppConfigJson {
   const now = Date.now();
   
-  // Return cached config if still valid
+  // Return cached config if still valid (unless force reload)
   if (!forceReload && configCache && (now - lastLoadTime) < CACHE_TTL) {
     return configCache;
   }
 
-  // Edge Runtime: can only use static import
+  // Edge Runtime or Browser: can only use static import
   if (!isNodeEnvironment() || typeof window !== 'undefined') {
     configCache = configData as AppConfigJson;
     lastLoadTime = now;
@@ -153,6 +157,32 @@ export function loadAppConfig(forceReload = false): AppConfigJson {
   // Node.js: load from storage based on mode
   const mode = getStorageMode();
   
+  if (mode === 'blob') {
+    // BLOB MODE: Trigger background refresh on first call or cache expiry
+    // This prevents blocking the main thread with async blob reads
+    if (forceReload || !configCache || (now - lastLoadTime) >= CACHE_TTL) {
+      // On first load attempt, mark as attempted to prevent multiple simultaneous loads
+      if (!initialBlobLoadAttempted) {
+        initialBlobLoadAttempted = true;
+        console.log('[Config] Triggering initial blob load...');
+      }
+      
+      // Trigger async refresh in background (don't wait)
+      loadAppConfigAsync(true).catch(err => {
+        console.error('[Config Loader] Background blob refresh failed:', err);
+      });
+      
+      // If we have cache, return it immediately (don't block)
+      if (configCache) {
+        return configCache;
+      }
+    }
+    
+    // If no cache exists, return static config as fallback
+    return configCache || (configData as AppConfigJson);
+  }
+  
+  // ENV or LOCAL mode: Load synchronously
   try {
     if (mode === 'env') {
       // Load from environment variable
@@ -163,7 +193,7 @@ export function loadAppConfig(forceReload = false): AppConfigJson {
         return configCache;
       }
     } else {
-      // Local file mode (development and production)
+      // Local file mode (development)
       // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
       const fs = require('fs');
       // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
@@ -254,11 +284,12 @@ export async function saveAppConfig(config: AppConfigJson): Promise<void> {
 /**
  * Load configuration asynchronously from Blob Storage
  * Use this in API routes for live config updates
+ * IMPORTANT: On Vercel with blob storage, always use this for fresh data
  */
 export async function loadAppConfigAsync(forceReload = false): Promise<AppConfigJson> {
   const now = Date.now();
   
-  // Return cached config if still valid
+  // Return cached config if still valid (unless force reload)
   if (!forceReload && configCache && (now - lastLoadTime) < CACHE_TTL) {
     return configCache;
   }
@@ -269,17 +300,24 @@ export async function loadAppConfigAsync(forceReload = false): Promise<AppConfig
     if (mode === 'blob' && isNodeEnvironment()) {
       // Load from Vercel Blob Storage
       const { list } = await import('@vercel/blob');
-      const { blobs } = await list({ prefix: 'appconfig.json' });
+      const { blobs } = await list({ prefix: 'appconfig.json', limit: 1 });
       
       if (blobs.length > 0) {
         const response = await fetch(blobs[0].url);
+        if (!response.ok) {
+          throw new Error(`Failed to fetch blob: ${response.status} ${response.statusText}`);
+        }
+        
         const config = await response.json() as AppConfigJson;
         
+        // Update cache
         configCache = config;
         lastLoadTime = now;
         
-        console.log('[Config] Loaded from Blob Storage');
+        console.log('[Config] Loaded from Blob Storage:', blobs[0].url);
         return config;
+      } else {
+        console.warn('[Config] No blob found for appconfig.json, using static config');
       }
     }
   } catch (error) {

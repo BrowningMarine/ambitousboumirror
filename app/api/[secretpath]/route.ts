@@ -1,10 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
-import { loadAppConfig, saveAppConfig } from "@/lib/json/config-loader";
+import { loadAppConfig, loadAppConfigAsync, saveAppConfig } from "@/lib/json/config-loader";
 
 // Simple in-memory rate limiter for authentication attempts
 const authAttempts = new Map<string, { count: number; resetAt: number }>();
 const MAX_ATTEMPTS = 5;
 const LOCKOUT_DURATION = 15 * 60 * 1000; // 15 minutes
+
+// Note: INTERNAL_API_SECRET check NOT used for this endpoint
+// This config admin route already has 4 security layers:
+// 1. Secret path validation (dynamic URL)
+// 2. Password authentication
+// 3. IP whitelist
+// 4. Rate limiting
+// Adding INTERNAL_API_SECRET would require exposing it to client-side code,
+// which defeats the purpose of having a secret.
 
 // Validate secret path
 async function validateSecretPath(secretpath: string): Promise<boolean> {
@@ -70,7 +79,8 @@ export async function GET(
       );
     }
 
-    const config = loadAppConfig();
+    // Load config from blob storage if available (ensures fresh data)
+    const config = await loadAppConfigAsync(true);
     
     // Encode the config data as Base64 for additional security
     const configString = JSON.stringify(config);
