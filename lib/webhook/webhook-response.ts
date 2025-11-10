@@ -116,50 +116,27 @@ async function sendMerchantWebhooks(results: WebhookResult[]): Promise<void> {
           // Get API key from first order (all orders with same URL should have same merchant/key)
           const apiKey = orders[0].apiKey;
           
-          if (orders.length === 1) {
-            // SINGLE ORDER: Send as object (backward compatible)
-            const order = orders[0];
-            const webhookData = {
-              odrId: order.odrId!,
-              merchantOrdId: order.merchantOrdId || '',
-              orderType: order.orderType!,
-              odrStatus: order.odrStatus!,
-              bankReceiveNumber: order.bankReceiveNumber || '',
-              bankReceiveOwnerName: order.bankReceiveOwnerName || '',
-              amount: order.paidAmount || 0,
-            };
-            
-            await sendWebhookNotification(
-              url,
-              webhookData,
-              apiKey,
-              true,
-              'webhook-payment-single'
-            );
-            
-            console.log(`📤 [Batching Mode] Sent single webhook to ${url} for order ${order.odrId}`);
-          } else {
-            // BULK ORDERS: Send as array in ONE request
-            const webhookData = orders.map(order => ({
-              odrId: order.odrId!,
-              merchantOrdId: order.merchantOrdId || '',
-              orderType: order.orderType!,
-              odrStatus: order.odrStatus!,
-              bankReceiveNumber: order.bankReceiveNumber || '',
-              bankReceiveOwnerName: order.bankReceiveOwnerName || '',
-              amount: order.paidAmount || 0,
-            }));
-            
-            await sendWebhookNotification(
-              url,
-              webhookData as unknown as Record<string, unknown>, // Bulk array format
-              apiKey,
-              true,
-              'webhook-payment-bulk'
-            );
-            
-            console.log(`📦 [Batching Mode] Sent bulk webhook to ${url} with ${orders.length} orders in ONE request`);
-          }
+          // BATCHING MODE: ALWAYS send as array (even for single items)
+          // This ensures consistent format for merchants - they always expect array[]
+          const webhookData = orders.map(order => ({
+            odrId: order.odrId!,
+            merchantOrdId: order.merchantOrdId || '',
+            orderType: order.orderType!,
+            odrStatus: order.odrStatus!,
+            bankReceiveNumber: order.bankReceiveNumber || '',
+            bankReceiveOwnerName: order.bankReceiveOwnerName || '',
+            amount: order.paidAmount || 0,
+          }));
+          
+          await sendWebhookNotification(
+            url,
+            webhookData as unknown as Record<string, unknown>, // Always array format
+            apiKey,
+            true,
+            orders.length === 1 ? 'webhook-payment-batch-single' : 'webhook-payment-batch-bulk'
+          );
+          
+          console.log(`📦 [Batching Mode] Sent webhook to ${url} with array[${orders.length}] (${orders.length === 1 ? 'single item' : 'bulk items'})`)
         } catch (error) {
           console.error(`❌ Failed to send webhook to ${url}:`, error);
           // Don't throw - webhook failures shouldn't block response

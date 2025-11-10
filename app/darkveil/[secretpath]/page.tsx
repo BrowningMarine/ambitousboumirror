@@ -780,7 +780,10 @@ export default function ConfigAdminPage() {
                               <strong>How it works:</strong> Groups orders by callback URL
                             </p>
                             <p>
-                              <strong>Example:</strong> 10 orders, same URL → 1 request with array[10]
+                              <strong>Format:</strong> ALWAYS array (even single items)
+                            </p>
+                            <p>
+                              <strong>Example:</strong> 1 order → array[1], 10 orders → array[10]
                             </p>
                             <p className="text-teal-700">
                               ✅ <strong>Benefits:</strong> 90%+ reduction in HTTP requests

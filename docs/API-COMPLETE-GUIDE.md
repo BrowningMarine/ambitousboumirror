@@ -770,21 +770,22 @@ Enable/disable batching in `lib/json/appconfig.json`:
 **Batching Enabled (Default):**
 - Groups orders by `urlCallBack`
 - Sends 1 request per unique URL
-- Array format for multiple orders
-- Object format for single order
+- **ALWAYS array format** (even for single orders - consistency!)
+- Single order: `[{...}]` (array with 1 item)
+- Multiple orders: `[{...}, {...}, {...}]` (array with N items)
 
 **Example:**
 ```
 3 orders with callback: https://webhook.site/abc123
 → 1 webhook request with array[3]
 
-2 orders with callback: https://webhook.site/def456
-→ 1 webhook request with array[2]
+1 order with callback: https://webhook.site/def456
+→ 1 webhook request with array[1] ← Still an array!
 ```
 
 **Batching Disabled:**
 - Sends separate request for each order
-- Always object format
+- Always object format (not array)
 - More webhook requests
 - Backward compatible
 

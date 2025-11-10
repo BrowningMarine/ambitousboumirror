@@ -1,11 +1,14 @@
 /**
- * Centralized Configuration Loader
- * Loads configuration from lib/json/appconfig.json
- * Legacy appconfig.ts now depends on this file
+ * Centralized Configuration Loader with Cloud Storage Support
+ * 
+ * Storage Modes:
+ * - LOCAL: Read/write to lib/json/appconfig.json (development only)
+ * - BLOB: Use Vercel Blob Storage (production - works on Vercel & Render)
+ * - ENV: Read from APPCONFIG_JSON environment variable (read-only fallback)
  * 
  * IMPORTANT: This file works in both Node.js and Edge Runtime
- * - Edge Runtime (middleware): Uses static JSON import
- * - Node.js (API routes): Can dynamically reload from disk
+ * - Edge Runtime (middleware): Uses static JSON import or ENV
+ * - Node.js (API routes): Can use Blob Storage or local file
  */
 
 import configData from './appconfig.json';
@@ -100,8 +103,22 @@ export interface AppConfigJson {
 
 // Singleton instance - starts with static JSON data
 let configCache: AppConfigJson | null = configData as AppConfigJson;
-let lastLoadTime = Date.now(); // Initialize as if just loaded
-const CACHE_TTL = 5000; // 5 seconds cache to reduce file reads
+let lastLoadTime = Date.now();
+const CACHE_TTL = 5000; // 5 seconds cache
+
+// Storage mode detection
+function getStorageMode(): 'local' | 'blob' | 'env' {
+  const mode = process.env.CONFIG_STORAGE_MODE;
+  if (mode === 'blob') return 'blob';
+  if (mode === 'env') return 'env';
+  
+  // Auto-detect: use blob in production (Vercel/Render), local in development
+  if (process.env.VERCEL || process.env.RENDER) {
+    return process.env.BLOB_READ_WRITE_TOKEN ? 'blob' : 'env';
+  }
+  
+  return 'local';
+}
 
 /**
  * Check if we're in Node.js environment (not Edge Runtime)
@@ -113,9 +130,10 @@ function isNodeEnvironment(): boolean {
 }
 
 /**
- * Load configuration from JSON file
- * Cached for 5 seconds to reduce file I/O
- * Works in both Edge Runtime (static) and Node.js (dynamic reload)
+ * Load configuration with smart caching
+ * - In Edge Runtime: Always uses static JSON import (cannot reload)
+ * - In Node.js: Can dynamically reload from storage based on mode
+ * - Uses 5-second cache to reduce reads
  */
 export function loadAppConfig(forceReload = false): AppConfigJson {
   const now = Date.now();
@@ -125,75 +143,149 @@ export function loadAppConfig(forceReload = false): AppConfigJson {
     return configCache;
   }
 
-  // Try to dynamically reload (only works in Node.js, not Edge Runtime)
-  if (isNodeEnvironment() && typeof window === 'undefined') {
-    try {
-      // Dynamic import to avoid webpack bundling for client
+  // Edge Runtime: can only use static import
+  if (!isNodeEnvironment() || typeof window !== 'undefined') {
+    configCache = configData as AppConfigJson;
+    lastLoadTime = now;
+    return configCache;
+  }
+
+  // Node.js: load from storage based on mode
+  const mode = getStorageMode();
+  
+  try {
+    if (mode === 'env') {
+      // Load from environment variable
+      const envConfig = process.env.APPCONFIG_JSON;
+      if (envConfig) {
+        configCache = JSON.parse(envConfig) as AppConfigJson;
+        lastLoadTime = now;
+        return configCache;
+      }
+    } else {
+      // Local file mode (development and production)
       // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
       const fs = require('fs');
       // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
       const path = require('path');
       const configPath = path.join(process.cwd(), 'lib', 'json', 'appconfig.json');
-      const fileContent = fs.readFileSync(configPath, 'utf-8');
-      const config = JSON.parse(fileContent) as AppConfigJson;
       
-      // Update cache
-      configCache = config;
-      lastLoadTime = now;
-      
-      return config;
-    } catch (error) {
-      console.error('Failed to dynamically load appconfig.json:', error);
-      
-      // Fall back to cached config if available
-      if (configCache) {
-        console.warn('Using cached config due to load error');
+      if (fs.existsSync(configPath)) {
+        const fileContent = fs.readFileSync(configPath, 'utf-8');
+        configCache = JSON.parse(fileContent) as AppConfigJson;
+        lastLoadTime = now;
         return configCache;
       }
     }
+  } catch (error) {
+    console.error('[Config Loader] Error loading config:', error);
   }
 
-  // Edge Runtime or cache available: return cached/static config
+  // Fallback to cached config or static import
   if (configCache) {
     return configCache;
   }
 
-  // Should never reach here since configCache is initialized with static data
-  throw new Error('Cannot load appconfig.json and no cache available');
+  configCache = configData as AppConfigJson;
+  lastLoadTime = now;
+  return configCache;
 }
 
 /**
- * Save configuration to JSON file
- * Updates cache and writes to disk (Node.js only)
+ * Save configuration to storage
+ * - BLOB mode: Use Vercel Blob Storage API (async)
+ * - LOCAL mode: Write to file system
+ * - ENV mode: Cannot save (read-only)
  */
-export function saveAppConfig(config: AppConfigJson): void {
+export async function saveAppConfig(config: AppConfigJson): Promise<void> {
   // Only works in Node.js environment
   if (!isNodeEnvironment()) {
     throw new Error('saveAppConfig is only available in Node.js environment');
   }
 
+  const mode = getStorageMode();
+  
+  // Update metadata
+  config._metadata.lastModified = new Date().toISOString();
+
   try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
-    const fs = require('fs');
-    // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
-    const path = require('path');
-    const configPath = path.join(process.cwd(), 'lib', 'json', 'appconfig.json');
-    
-    // Update metadata
-    config._metadata.lastModified = new Date().toISOString();
-    
-    // Write to file with pretty formatting
-    fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');
-    
-    // Update cache
-    configCache = config;
-    lastLoadTime = Date.now();
-    
-    console.log('Configuration saved successfully');
+    if (mode === 'blob') {
+      // Use Vercel Blob Storage
+      const { put } = await import('@vercel/blob');
+      const blob = await put('appconfig.json', JSON.stringify(config, null, 2), {
+        access: 'public',
+        addRandomSuffix: false,
+      });
+      
+      console.log('[Config] Saved to Blob Storage:', blob.url);
+      
+      // Update cache immediately
+      configCache = config;
+      lastLoadTime = Date.now();
+      
+    } else if (mode === 'env') {
+      throw new Error('Cannot save config in ENV mode - environment variables are read-only');
+      
+    } else {
+      // Local file mode
+      // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+      const fs = require('fs');
+      // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+      const path = require('path');
+      const configPath = path.join(process.cwd(), 'lib', 'json', 'appconfig.json');
+      
+      // Write to file with pretty formatting
+      fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');
+      
+      console.log('[Config] Saved to local file');
+      
+      // Update cache
+      configCache = config;
+      lastLoadTime = Date.now();
+    }
   } catch (error) {
-    console.error('Failed to save appconfig.json:', error);
-    throw new Error('Cannot save appconfig.json');
+    console.error('[Config] Failed to save:', error);
+    throw new Error(`Cannot save config: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
+}
+
+/**
+ * Load configuration asynchronously from Blob Storage
+ * Use this in API routes for live config updates
+ */
+export async function loadAppConfigAsync(forceReload = false): Promise<AppConfigJson> {
+  const now = Date.now();
+  
+  // Return cached config if still valid
+  if (!forceReload && configCache && (now - lastLoadTime) < CACHE_TTL) {
+    return configCache;
+  }
+
+  const mode = getStorageMode();
+
+  try {
+    if (mode === 'blob' && isNodeEnvironment()) {
+      // Load from Vercel Blob Storage
+      const { list } = await import('@vercel/blob');
+      const { blobs } = await list({ prefix: 'appconfig.json' });
+      
+      if (blobs.length > 0) {
+        const response = await fetch(blobs[0].url);
+        const config = await response.json() as AppConfigJson;
+        
+        configCache = config;
+        lastLoadTime = now;
+        
+        console.log('[Config] Loaded from Blob Storage');
+        return config;
+      }
+    }
+  } catch (error) {
+    console.error('[Config] Error loading from blob, using fallback:', error);
+  }
+
+  // Fallback to sync load
+  return loadAppConfig(forceReload);
 }
 
 /**

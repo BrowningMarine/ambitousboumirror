@@ -165,9 +165,9 @@ export async function POST(
         );
       }
 
-      // Save config
+      // Save config (now async)
       try {
-        saveAppConfig(config);
+        await saveAppConfig(config);
         console.log(`Config saved by IP: ${ip}`);
         
         // Check if restart is required
