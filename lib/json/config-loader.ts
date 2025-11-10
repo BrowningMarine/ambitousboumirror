@@ -215,6 +215,8 @@ export async function saveAppConfig(config: AppConfigJson): Promise<void> {
       const blob = await put('appconfig.json', JSON.stringify(config, null, 2), {
         access: 'public',
         addRandomSuffix: false,
+        contentType: 'application/json',
+        allowOverwrite: true, // Allow updating existing config
       });
       
       console.log('[Config] Saved to Blob Storage:', blob.url);

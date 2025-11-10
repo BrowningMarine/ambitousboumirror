@@ -152,14 +152,14 @@ export default function ConfigAdminPage() {
     }
   };
 
-  // Decrypt payment URL using AES-256-CBC
+  // Decrypt payment URL using AES-256-GCM (matches encryption in lib/payment-encoder.ts)
   const decryptPaymentUrl = async () => {
     if (!encryptedUrl.trim()) {
       setDecryptionError("Please enter an encrypted URL");
       return;
     }
 
-    if (!config?.security?.paymentEncryptKey) {
+    if (!config?.security?.paymentEncryptionKey) {
       setDecryptionError("Payment encryption key not configured");
       return;
     }
@@ -167,41 +167,59 @@ export default function ConfigAdminPage() {
     try {
       setDecryptionError("");
       
-      // The encrypted URL format: iv:encryptedData
-      const parts = encryptedUrl.split(":");
-      if (parts.length !== 2) {
-        throw new Error("Invalid encrypted URL format. Expected format: iv:encryptedData");
+      // Convert URL-safe base64 back to standard base64
+      const base64 = encryptedUrl
+        .replace(/-/g, '+')
+        .replace(/_/g, '/')
+        .padEnd(encryptedUrl.length + (4 - (encryptedUrl.length % 4)) % 4, '=');
+      
+      // Decode from base64
+      const combined = atob(base64);
+      
+      // Split IV, authTag, and encrypted data (format: iv:authTag:encrypted)
+      const parts = combined.split(":");
+      if (parts.length !== 3) {
+        throw new Error("Invalid encrypted URL format. Expected format: iv:authTag:encryptedData (base64 encoded)");
       }
 
-      const [ivHex, encryptedHex] = parts;
+      const [ivHex, authTagHex, encryptedHex] = parts;
       
       // Convert hex strings to Uint8Array
       const iv = new Uint8Array(ivHex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
+      const authTag = new Uint8Array(authTagHex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
       const encryptedData = new Uint8Array(encryptedHex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
       
-      // Derive key from encryption key using SHA-256
-      const keyMaterial = new TextEncoder().encode(config.security.paymentEncryptKey);
-      const hashBuffer = await crypto.subtle.digest("SHA-256", keyMaterial);
+      // Derive key from encryption key (32 bytes for AES-256)
+      const keyMaterial = new TextEncoder().encode(
+        config.security.paymentEncryptionKey.padEnd(32, '0').substring(0, 32)
+      );
       
-      // Import the key
+      // Import the key for AES-GCM
       const cryptoKey = await crypto.subtle.importKey(
         "raw",
-        hashBuffer,
-        { name: "AES-CBC" },
+        keyMaterial,
+        { name: "AES-GCM" },
         false,
         ["decrypt"]
       );
       
-      // Decrypt
+      // Decrypt using AES-GCM
       const decryptedBuffer = await crypto.subtle.decrypt(
-        { name: "AES-CBC", iv },
+        { 
+          name: "AES-GCM", 
+          iv,
+          tagLength: 128 // 16 bytes
+        },
         cryptoKey,
-        encryptedData
+        new Uint8Array([...encryptedData, ...authTag]) // Append auth tag to encrypted data
       );
       
-      // Convert to string
+      // Convert to string and parse JSON
       const decrypted = new TextDecoder().decode(decryptedBuffer);
-      setDecryptedUrl(decrypted);
+      const paymentData = JSON.parse(decrypted);
+      
+      // Format as readable JSON
+      setDecryptedUrl(JSON.stringify(paymentData, null, 2));
       setDecryptionError("");
     } catch (err) {
       setDecryptionError(
@@ -1574,11 +1592,13 @@ export default function ConfigAdminPage() {
                       <Alert className="bg-gray-50">
                         <AlertTriangle className="h-4 w-4" />
                         <AlertDescription>
-                          <strong>Decryption Algorithm:</strong> AES-256-CBC
+                          <strong>Decryption Algorithm:</strong> AES-256-GCM (Galois/Counter Mode)
                           <br />
-                          <strong>Key Derivation:</strong> SHA-256 hash of Payment Encryption Key
+                          <strong>Key Format:</strong> 32-byte key (padded if shorter)
                           <br />
-                          <strong>Format:</strong> The encrypted string contains IV (Initialization Vector) and encrypted data separated by colon
+                          <strong>Input Format:</strong> Base64-encoded string containing iv:authTag:encryptedData (hex format)
+                          <br />
+                          <strong>Usage:</strong> Paste the full encrypted URL path segment to decrypt and view payment data
                         </AlertDescription>
                       </Alert>
                     </div>

@@ -1,7 +1,7 @@
 {
   "_metadata": {
     "version": "2.0.0",
-    "lastModified": "2025-11-07T07:33:48.810Z",
+    "lastModified": "2025-11-10T17:22:41.645Z",
     "description": "Application configuration - controls core system behavior. Most settings here, secrets in .env",
     "requiresRestart": {
       "paymentEncryptionKey": true,
@@ -110,7 +110,7 @@
     "requiresRestart": "Check _metadata.requiresRestart to see which changes need server restart"
   },
   "databaseSettings": {
-    "supabaseOrderPrefix": "EMO",
+    "supabaseOrderPrefix": "EDO",
     "coreRunningMode": "appwrite",
     "availableModes": [
       "auto",
@@ -124,12 +124,13 @@
       "supabase": "Use Supabase database only",
       "fallback": "No database writes - uses config fallback bank/merchant, validates by timestamp"
     },
-    "fallbackOrderPrefix": "FBO",
+    "fallbackOrderPrefix": "FDO",
     "databasePriority": [
       "appwrite",
       "supabase",
       "fallback"
-    ]
+    ],
+    "appwriteOrderPrefix": "ADO"
   },
   "webhookSettings": {
     "enableCallbackBatching": true,
