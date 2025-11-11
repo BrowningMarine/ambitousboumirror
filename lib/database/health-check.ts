@@ -20,24 +20,8 @@ interface HealthStatus {
 const healthCache = new Map<string, HealthStatus>();
 const HEALTH_CHECK_CACHE_MS = 30000; // Cache health status for 30 seconds (increased from 5s)
 const HEALTH_CHECK_SOFT_CACHE_MS = 10000; // Trigger background refresh after 10 seconds
-const MAX_CONSECUTIVE_FAILURES = 3; // Mark as unhealthy after 3 failures
-const HEALTH_CHECK_TIMEOUT_MS = 2000; // 2 second timeout for health checks (reduced from 3s)
-
-// OPTIMIZATION: Optimistic initialization - assume databases are healthy on first request
-// This prevents blocking on cold start. Background health check will update if actually unhealthy.
-healthCache.set('appwrite', {
-  isHealthy: true,
-  lastChecked: Date.now(),
-  consecutiveFailures: 0,
-  backgroundCheckInProgress: false
-});
-
-healthCache.set('supabase', {
-  isHealthy: true,
-  lastChecked: Date.now() - 15000, // Aged cache triggers background check sooner
-  consecutiveFailures: 0,
-  backgroundCheckInProgress: false
-});
+const MAX_CONSECUTIVE_FAILURES = 1; // Mark as unhealthy immediately (changed from 3)
+const HEALTH_CHECK_TIMEOUT_MS = 3000; // 3 second timeout for health checks
 
 /**
  * Check if Appwrite database is healthy
@@ -99,9 +83,22 @@ async function performAppwriteHealthCheck(cacheKey: string): Promise<boolean> {
 
     return true;
   } catch (error) {
+    // Special handling for specific error codes
+    let forceUnhealthy = false;
+    
+    // Check for critical errors that should immediately mark as unhealthy
+    if (error && typeof error === 'object' && 'code' in error) {
+      const errorCode = (error as { code: number }).code;
+      // 522 = Connection timeout, 503 = Service unavailable, 502 = Bad gateway
+      if (errorCode === 522 || errorCode === 503 || errorCode === 502) {
+        forceUnhealthy = true;
+        console.error(`❌ [Appwrite Health] Critical error ${errorCode} - marking as unhealthy immediately`);
+      }
+    }
+    
     // Update failure count
     const current = healthCache.get(cacheKey) || { isHealthy: true, lastChecked: 0, consecutiveFailures: 0 };
-    const consecutiveFailures = current.consecutiveFailures + 1;
+    const consecutiveFailures = forceUnhealthy ? MAX_CONSECUTIVE_FAILURES : current.consecutiveFailures + 1;
     const isHealthy = consecutiveFailures < MAX_CONSECUTIVE_FAILURES;
 
     healthCache.set(cacheKey, {
@@ -113,8 +110,10 @@ async function performAppwriteHealthCheck(cacheKey: string): Promise<boolean> {
 
     console.warn('Appwrite health check failed:', {
       error: error instanceof Error ? error.message : String(error),
+      errorCode: error && typeof error === 'object' && 'code' in error ? (error as { code: number }).code : undefined,
       consecutiveFailures,
-      markedUnhealthy: !isHealthy
+      markedUnhealthy: !isHealthy,
+      forcedUnhealthy: forceUnhealthy
     });
 
     return isHealthy;

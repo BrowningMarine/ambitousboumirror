@@ -1322,7 +1322,7 @@ async function processSingleOrderOptimized(
         createdOrder = transactionResult.data;
       } catch (error) {
         console.error('Appwrite transaction creation failed:', error);
-        throw new Error(`Failed to create transaction in Appwrite: ${error instanceof Error ? error.message : String(error)}`);
+        throw new Error(`Failed to create transaction: ${error instanceof Error ? error.message : String(error)}`);
       }
     } else if (healthyDatabase === 'supabase') {
       // Fallback: Write to Supabase backup database
@@ -1394,7 +1394,7 @@ async function processSingleOrderOptimized(
         transactionResult = { success: true, data: createdOrder };
       } catch (error) {
         console.error('Supabase transaction creation failed:', error);
-        throw new Error(`Failed to create transaction in Supabase: ${error instanceof Error ? error.message : String(error)}`);
+        throw new Error(`Failed to create transaction in: ${error instanceof Error ? error.message : String(error)}`);
       }
     } else {
       // Fallback mode or both databases unhealthy

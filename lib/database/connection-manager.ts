@@ -98,8 +98,9 @@ export class DatabaseConnectionManager {
     operationName: string,
     maxRetries: number = 3
   ): Promise<T> {
-    // Check circuit breaker
-    if (this.isCircuitOpen()) {
+    // Check circuit breaker - BUT allow fallback operations to always proceed
+    // Fallback operations end with '-fallback' suffix
+    if (this.isCircuitOpen() && !operationName.endsWith('-fallback')) {
       throw new Error(`Database circuit breaker is open for ${operationName}`);
     }
 
@@ -126,7 +127,10 @@ export class DatabaseConnectionManager {
           );
 
         if (!isRetryableError || attempt === maxRetries) {
-          this.recordFailure();
+          // Don't record failure for fallback operations - they're expected to fail
+          if (!operationName.endsWith('-fallback')) {
+            this.recordFailure();
+          }
           throw error;
         }
 
@@ -147,7 +151,10 @@ export class DatabaseConnectionManager {
       }
     }
 
-    this.recordFailure();
+    // Don't record failure for fallback operations
+    if (!operationName.endsWith('-fallback')) {
+      this.recordFailure();
+    }
     throw lastError || new Error(`Failed after ${maxRetries} retries`);
   }
 

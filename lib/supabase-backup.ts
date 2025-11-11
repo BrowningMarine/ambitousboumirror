@@ -20,7 +20,7 @@ let supabaseClient: SupabaseClient | null = null;
  */
 export function getSupabaseClient(): SupabaseClient {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-    throw new Error('Supabase configuration missing. Set SUPABASE_URL and SUPABASE_SERVICE_KEY environment variables.');
+    throw new Error('Configuration missing. Set BK_URL and BK_KEY environment variables.');
   }
 
   // Validate that we're using service_role key, not anon key
@@ -33,11 +33,11 @@ export function getSupabaseClient(): SupabaseClient {
         if (payload.role === 'anon') {
           console.error('❌ CRITICAL: Using anon key instead of service_role key!');
           console.error('Get the service_role key from: Supabase Dashboard → Settings → API');
-          throw new Error('Invalid Supabase key: SUPABASE_SERVICE_KEY must be service_role key, not anon key. Check your .env file.');
+          throw new Error('Invalid bk key: BK_KEY must be service_role key, not anon key. Check your .env file.');
         }
       }
     } catch (parseError) {
-      console.warn('Could not validate Supabase key format:', parseError);
+      console.warn('Could not validate BK_KEY format:', parseError);
     }
   }
 

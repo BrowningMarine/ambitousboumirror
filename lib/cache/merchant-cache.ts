@@ -83,14 +83,16 @@ export class MerchantCacheService {
       }
 
       // LAYER 2: Check Supabase cache (L2) - fast fallback
-      if (healthyDatabase === 'supabase' || healthyDatabase === 'none') {
+      // Only use L2 cache when databases are completely down (healthyDatabase === 'none')
+      // When healthyDatabase is 'supabase', we should query Supabase directly, not cache
+      if (healthyDatabase === 'none') {
         const l2Result = await this.getFromL2Cache(apiKey, merchantId);
         if (l2Result) {
           this.metrics.l2Hits++;
           // Store in L1 for next time
           this.storeInL1Cache(cacheKey, l2Result);
           const responseTime = performance.now() - startTime;
-          console.log(`✅ [L2 Cache HIT] Merchant verified in ${responseTime.toFixed(2)}ms (97% faster)`);
+          console.log(`✅ [L2 Cache HIT] Merchant verified in ${responseTime.toFixed(2)}ms (97% faster) - Fallback mode`);
           return l2Result;
         }
       }
@@ -217,19 +219,52 @@ export class MerchantCacheService {
 
   /**
    * Get merchant from L3 database (Appwrite or Supabase)
+   * IMPORTANT: Automatically retries with Supabase if Appwrite fails
+   * Falls back to JSON config when both databases are down
    */
   private static async getFromDatabase(
     apiKey: string,
     merchantId: string,
     healthyDatabase: 'appwrite' | 'supabase' | 'none'
   ): Promise<MerchantAccount | null> {
+    // Try primary database based on health check
     if (healthyDatabase === 'appwrite') {
-      return await this.getFromAppwrite(apiKey, merchantId);
+      try {
+        const appwriteResult = await this.getFromAppwrite(apiKey, merchantId);
+        if (appwriteResult) {
+          return appwriteResult;
+        }
+        // Appwrite returned null (not found) - try Supabase as fallback
+        console.log('⚠️ [Database Failover] Merchant not found in Appwrite, trying Supabase...');
+      } catch (error) {
+        // Appwrite query failed (network/timeout error) - immediately failover to Supabase
+        console.error('❌ [Database Failover] Appwrite query failed, failing over to Supabase:', 
+          error instanceof Error ? error.message : String(error));
+      }
+      
+      // Automatic failover: Try Supabase if Appwrite failed or returned null
+      try {
+        console.log('🔄 [Database Failover] Attempting Supabase fallback...');
+        const supabaseResult = await this.getFromSupabase(apiKey, merchantId);
+        if (supabaseResult) {
+          console.log('✅ [Database Failover] Successfully retrieved merchant from Supabase');
+          return supabaseResult;
+        }
+      } catch (supabaseError) {
+        console.error('❌ [Database Failover] Supabase fallback also failed:', 
+          supabaseError instanceof Error ? supabaseError.message : String(supabaseError));
+      }
+      
+      // Both databases failed - try JSON fallback
+      console.warn('⚠️ [Database Failover] Both databases failed, trying JSON fallback...');
+      return await this.getFromJSONFallback(apiKey, merchantId);
+      
     } else if (healthyDatabase === 'supabase') {
       return await this.getFromSupabase(apiKey, merchantId);
     } else {
-      // Fallback mode - check L2 cache or return null
-      return await this.getFromL2Cache(apiKey, merchantId);
+      // Fallback mode - both databases unhealthy, use JSON config
+      console.log('🟡 [Fallback Mode] Using JSON config for merchant verification');
+      return await this.getFromJSONFallback(apiKey, merchantId);
     }
   }
 
@@ -268,13 +303,118 @@ export class MerchantCacheService {
 
   /**
    * Get merchant from Supabase database
+   * Falls back to L2 cache if primary Supabase query fails
    */
   private static async getFromSupabase(
     apiKey: string,
     merchantId: string
   ): Promise<MerchantAccount | null> {
-    // Use L2 cache which queries Supabase
-    return await this.getFromL2Cache(apiKey, merchantId);
+    try {
+      // First, try to get from Supabase backup_accounts table (if it exists)
+      const supabaseCache = new MerchantAccountCacheService();
+      const supabase = supabaseCache['supabase']; // Access private supabase client
+      
+      // Try to query backup_accounts table (live merchant data in Supabase)
+      const { data: backupAccount, error: backupError } = await supabase
+        .from('backup_accounts')
+        .select('*')
+        .eq('api_key', apiKey)
+        .eq('public_transaction_id', merchantId)
+        .eq('status', true)
+        .single();
+      
+      if (!backupError && backupAccount) {
+        console.log('✅ [Supabase] Found merchant in backup_accounts table');
+        
+        // Convert Supabase backup_accounts format to MerchantAccount format
+        return {
+          $id: backupAccount.id || backupAccount.appwrite_doc_id,
+          publicTransactionId: backupAccount.public_transaction_id,
+          avaiableBalance: backupAccount.available_balance || 0,
+          status: backupAccount.status || true,
+          referenceUserId: backupAccount.reference_user_id,
+          minDepositAmount: backupAccount.min_deposit_amount,
+          maxDepositAmount: backupAccount.max_deposit_amount,
+          minWithdrawAmount: backupAccount.min_withdraw_amount,
+          maxWithdrawAmount: backupAccount.max_withdraw_amount,
+          depositWhitelistIps: backupAccount.deposit_whitelist_ips || [],
+          withdrawWhitelistIps: backupAccount.withdraw_whitelist_ips || [],
+          apiKey: backupAccount.api_key
+        };
+      }
+      
+      // Fallback: Use L2 cache (merchant_accounts_cache table)
+      console.log('⚠️ [Supabase] backup_accounts not found or table does not exist, falling back to L2 cache');
+      return await this.getFromL2Cache(apiKey, merchantId);
+      
+    } catch (error) {
+      console.error('❌ [Supabase] Primary query failed, falling back to L2 cache:', error);
+      // Final fallback to cache
+      return await this.getFromL2Cache(apiKey, merchantId);
+    }
+  }
+
+  /**
+   * Get merchant from JSON fallback configuration
+   * Used when both Appwrite and Supabase are unavailable
+   */
+  private static async getFromJSONFallback(
+    apiKey: string,
+    merchantId: string
+  ): Promise<MerchantAccount | null> {
+    try {
+      // Import dynamically to avoid circular dependencies
+      const { validateMerchantFallback, getMerchantLimitsFallback } = await import('@/lib/fallback-merchant-validation');
+      const { createHash } = await import('crypto');
+      
+      // Validate merchant credentials using JSON config
+      const validation = validateMerchantFallback(apiKey, undefined, 'deposit');
+      
+      if (!validation.success) {
+        console.log('❌ [JSON Fallback] Merchant validation failed:', validation.error);
+        return null;
+      }
+      
+      // Use the merchant ID from validation result (config key)
+      const configMerchantId = validation.merchantId!;
+      
+      // Get merchant limits from JSON config
+      const depositLimits = getMerchantLimitsFallback(configMerchantId, 'deposit');
+      const withdrawLimits = getMerchantLimitsFallback(configMerchantId, 'withdraw');
+      
+      // Load full merchant config
+      const { loadAppConfig } = await import('@/lib/json/config-loader');
+      const config = loadAppConfig();
+      const merchantConfig = config.merchants[configMerchantId];
+      
+      if (!merchantConfig) {
+        console.log('❌ [JSON Fallback] Merchant config not found in appconfig.json');
+        return null;
+      }
+      
+      console.log('✅ [JSON Fallback] Successfully validated merchant from appconfig.json');
+      
+      // Create merchant account object from JSON config
+      // Use the merchantId parameter (publicTransactionId from request) as the public ID
+      return {
+        $id: validation.accountId || configMerchantId,
+        publicTransactionId: merchantId, // Use the publicTransactionId from request
+        avaiableBalance: 0, // No balance tracking in fallback mode
+        status: true, // Already validated as enabled
+        referenceUserId: undefined,
+        minDepositAmount: depositLimits?.minAmount,
+        maxDepositAmount: depositLimits?.maxAmount,
+        minWithdrawAmount: withdrawLimits?.minAmount,
+        maxWithdrawAmount: withdrawLimits?.maxAmount,
+        depositWhitelistIps: merchantConfig.depositWhitelistIps || [],
+        withdrawWhitelistIps: merchantConfig.withdrawWhitelistIps || [],
+        apiKey: createHash('sha256').update(apiKey).digest('hex') // Store hash, not plain key
+      };
+      
+    } catch (error) {
+      console.error('❌ [JSON Fallback] Error loading merchant from JSON config:', error);
+      return null;
+    }
   }
 
   /**
