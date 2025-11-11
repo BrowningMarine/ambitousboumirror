@@ -1,14 +1,21 @@
 /**
- * Centralized Configuration Loader with Cloud Storage Support
+ * Centralized Configuration Loader - ZERO RUNTIME COST
  * 
- * Storage Modes:
- * - LOCAL: Read/write to lib/json/appconfig.json (development only)
- * - BLOB: Use Vercel Blob Storage (production - works on Vercel & Render)
- * - ENV: Read from APPCONFIG_JSON environment variable (read-only fallback)
+ * Reading Strategy (ZERO COST):
+ * - Always uses static JSON import (loaded once at build/startup)
+ * - Optional override via APPCONFIG_JSON environment variable
+ * - No blob storage reads during runtime = ZERO operations cost
+ * 
+ * Writing Strategy (ONLY WHEN YOU UPDATE):
+ * - Admin updates save to Blob Storage (one-time cost per update)
+ * - Then you manually update APPCONFIG_JSON env var in Vercel/Render
+ * - Redeploy to pick up new config (free operation)
+ * 
+ * Result: 10k orders = 0 blob operations, 1 config update = 1 blob write
  * 
  * IMPORTANT: This file works in both Node.js and Edge Runtime
  * - Edge Runtime (middleware): Uses static JSON import or ENV
- * - Node.js (API routes): Can use Blob Storage or local file
+ * - Node.js (API routes): Uses static JSON import or ENV, saves to Blob
  */
 
 import configData from './appconfig.json';
@@ -101,23 +108,18 @@ export interface AppConfigJson {
   _instructions: Record<string, string>;
 }
 
-// Singleton instance - starts with static JSON data
-let configCache: AppConfigJson | null = configData as AppConfigJson;
-let lastLoadTime = Date.now();
-const CACHE_TTL = 5000; // 5 seconds cache
+// Singleton instance - loaded ONCE at startup (zero ongoing cost)
+let configCache: AppConfigJson | null = null;
+let configInitialized = false;
 
-// Track if we've attempted initial blob load
-let initialBlobLoadAttempted = false;
-
-// Storage mode detection
-function getStorageMode(): 'local' | 'blob' | 'env' {
+// Storage mode detection for WRITES only
+function getWriteMode(): 'local' | 'blob' {
   const mode = process.env.CONFIG_STORAGE_MODE;
-  if (mode === 'blob') return 'blob';
-  if (mode === 'env') return 'env';
+  if (mode === 'local') return 'local';
   
   // Auto-detect: use blob in production (Vercel/Render), local in development
   if (process.env.VERCEL || process.env.RENDER) {
-    return process.env.BLOB_READ_WRITE_TOKEN ? 'blob' : 'env';
+    return process.env.BLOB_READ_WRITE_TOKEN ? 'blob' : 'local';
   }
   
   return 'local';
@@ -133,65 +135,153 @@ function isNodeEnvironment(): boolean {
 }
 
 /**
- * Load configuration with smart caching
- * - In Edge Runtime: Always uses static JSON import (cannot reload)
- * - In Node.js Blob mode: Triggers async refresh, returns cache
- * - In Node.js Local/Env mode: Loads synchronously
- * - Uses 5-second cache to reduce reads
+ * Load configuration - ZERO COST OPERATION
+ * 
+ * Strategy:
+ * 1. First call: Initialize from ENV variable (if exists) or static JSON
+ * 2. Subsequent calls: Return cached config (loaded once at startup)
+ * 3. Force reload: Re-check ENV variable, fallback to static JSON
+ * 
+ * This means: NO blob storage reads, NO file system reads per request
+ * Result: Zero runtime cost for reading config
  */
 export function loadAppConfig(forceReload = false): AppConfigJson {
-  const now = Date.now();
-  
-  // Return cached config if still valid (unless force reload)
-  if (!forceReload && configCache && (now - lastLoadTime) < CACHE_TTL) {
+  // If already initialized and not forcing reload, return cache immediately
+  if (configInitialized && !forceReload && configCache) {
     return configCache;
   }
 
-  // Edge Runtime or Browser: can only use static import
-  if (!isNodeEnvironment() || typeof window !== 'undefined') {
-    configCache = configData as AppConfigJson;
-    lastLoadTime = now;
-    return configCache;
-  }
-
-  // Node.js: load from storage based on mode
-  const mode = getStorageMode();
-  
-  if (mode === 'blob') {
-    // BLOB MODE: Trigger background refresh on first call or cache expiry
-    // This prevents blocking the main thread with async blob reads
-    if (forceReload || !configCache || (now - lastLoadTime) >= CACHE_TTL) {
-      // On first load attempt, mark as attempted to prevent multiple simultaneous loads
-      if (!initialBlobLoadAttempted) {
-        initialBlobLoadAttempted = true;
-        console.log('[Config] Triggering initial blob load...');
-      }
-      
-      // Trigger async refresh in background (don't wait)
-      loadAppConfigAsync(true).catch(err => {
-        console.error('[Config Loader] Background blob refresh failed:', err);
-      });
-      
-      // If we have cache, return it immediately (don't block)
-      if (configCache) {
+  // Initialize configuration (happens once per deployment)
+  try {
+    // Priority 1: Environment variable (set manually after blob update)
+    const envConfig = process.env.APPCONFIG_JSON;
+    if (envConfig) {
+      try {
+        configCache = JSON.parse(envConfig) as AppConfigJson;
+        configInitialized = true;
+        if (!forceReload) {
+          console.log('[Config] ✓ Loaded from APPCONFIG_JSON environment variable (zero cost)');
+        }
         return configCache;
+      } catch (parseError) {
+        console.error('[Config] Failed to parse APPCONFIG_JSON env var:', parseError);
+        // Fall through to static import
       }
     }
-    
-    // If no cache exists, return static config as fallback
-    return configCache || (configData as AppConfigJson);
-  }
-  
-  // ENV or LOCAL mode: Load synchronously
-  try {
-    if (mode === 'env') {
-      // Load from environment variable
-      const envConfig = process.env.APPCONFIG_JSON;
-      if (envConfig) {
-        configCache = JSON.parse(envConfig) as AppConfigJson;
-        lastLoadTime = now;
-        return configCache;
+
+    // Priority 2: Local file (development only)
+    if (isNodeEnvironment() && !process.env.VERCEL && !process.env.RENDER) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+        const fs = require('fs');
+        // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+        const path = require('path');
+        const configPath = path.join(process.cwd(), 'lib', 'json', 'appconfig.json');
+        
+        if (fs.existsSync(configPath)) {
+          const fileContent = fs.readFileSync(configPath, 'utf-8');
+          configCache = JSON.parse(fileContent) as AppConfigJson;
+          configInitialized = true;
+          if (!forceReload) {
+            console.log('[Config] ✓ Loaded from local file (development mode)');
+          }
+          return configCache;
+        }
+      } catch (fsError) {
+        console.error('[Config] Failed to read local file:', fsError);
+        // Fall through to static import
       }
+    }
+
+    // Priority 3: Static JSON import (build-time, always available, zero cost)
+    configCache = configData as AppConfigJson;
+    configInitialized = true;
+    if (!forceReload) {
+      console.log('[Config] ✓ Loaded from static JSON import (zero cost)');
+    }
+    return configCache;
+
+  } catch (error) {
+    console.error('[Config] Critical error loading config:', error);
+    
+    // Emergency fallback: always return static import
+    configCache = configData as AppConfigJson;
+    configInitialized = true;
+    return configCache;
+  }
+}
+
+/**
+ * Save configuration to storage
+ * 
+ * Production workflow (costs 1 blob write operation):
+ * 1. Save to Blob Storage (this function)
+ * 2. Copy the JSON output from the response
+ * 3. Manually update APPCONFIG_JSON environment variable in Vercel/Render
+ * 4. Redeploy (or config reloads automatically on next cold start)
+ * 
+ * Development workflow:
+ * - Writes directly to lib/json/appconfig.json file
+ * 
+ * Result: Only costs when YOU update config, not when users create orders
+ */
+export async function saveAppConfig(config: AppConfigJson): Promise<{ 
+  success: boolean; 
+  mode: string; 
+  blobUrl?: string;
+  configJson?: string;
+  instructions?: string;
+}> {
+  // Only works in Node.js environment
+  if (!isNodeEnvironment()) {
+    throw new Error('saveAppConfig is only available in Node.js environment');
+  }
+
+  const mode = getWriteMode();
+  
+  // Update metadata
+  config._metadata.lastModified = new Date().toISOString();
+  const configJson = JSON.stringify(config, null, 2);
+
+  try {
+    if (mode === 'blob') {
+      // Use Vercel Blob Storage (1 write operation cost)
+      const { put } = await import('@vercel/blob');
+      const blob = await put('appconfig.json', configJson, {
+        access: 'public',
+        addRandomSuffix: false,
+        contentType: 'application/json',
+        allowOverwrite: true,
+      });
+      
+      console.log('[Config] ✓ Saved to Blob Storage:', blob.url);
+      console.log('[Config] ⚠ IMPORTANT: To apply changes, update APPCONFIG_JSON environment variable');
+      
+      // Update local cache immediately for current instance
+      configCache = config;
+      configInitialized = true;
+      
+      return {
+        success: true,
+        mode: 'blob',
+        blobUrl: blob.url,
+        configJson,
+        instructions: [
+          '✓ Config saved to Blob Storage',
+          '',
+          '📋 Next Steps (to apply changes):',
+          '1. Copy the "configJson" field from this response',
+          '2. In Vercel/Render dashboard:',
+          '   - Go to Environment Variables',
+          '   - Update APPCONFIG_JSON with the copied JSON',
+          '   - Save changes',
+          '3. Redeploy or wait for next cold start',
+          '',
+          '💡 This workflow ensures ZERO blob read costs during order creation',
+          `📊 Blob URL (for reference): ${blob.url}`
+        ].join('\n')
+      };
+      
     } else {
       // Local file mode (development)
       // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
@@ -200,80 +290,21 @@ export function loadAppConfig(forceReload = false): AppConfigJson {
       const path = require('path');
       const configPath = path.join(process.cwd(), 'lib', 'json', 'appconfig.json');
       
-      if (fs.existsSync(configPath)) {
-        const fileContent = fs.readFileSync(configPath, 'utf-8');
-        configCache = JSON.parse(fileContent) as AppConfigJson;
-        lastLoadTime = now;
-        return configCache;
-      }
-    }
-  } catch (error) {
-    console.error('[Config Loader] Error loading config:', error);
-  }
-
-  // Fallback to cached config or static import
-  if (configCache) {
-    return configCache;
-  }
-
-  configCache = configData as AppConfigJson;
-  lastLoadTime = now;
-  return configCache;
-}
-
-/**
- * Save configuration to storage
- * - BLOB mode: Use Vercel Blob Storage API (async)
- * - LOCAL mode: Write to file system
- * - ENV mode: Cannot save (read-only)
- */
-export async function saveAppConfig(config: AppConfigJson): Promise<void> {
-  // Only works in Node.js environment
-  if (!isNodeEnvironment()) {
-    throw new Error('saveAppConfig is only available in Node.js environment');
-  }
-
-  const mode = getStorageMode();
-  
-  // Update metadata
-  config._metadata.lastModified = new Date().toISOString();
-
-  try {
-    if (mode === 'blob') {
-      // Use Vercel Blob Storage
-      const { put } = await import('@vercel/blob');
-      const blob = await put('appconfig.json', JSON.stringify(config, null, 2), {
-        access: 'public',
-        addRandomSuffix: false,
-        contentType: 'application/json',
-        allowOverwrite: true, // Allow updating existing config
-      });
-      
-      console.log('[Config] Saved to Blob Storage:', blob.url);
-      
-      // Update cache immediately
-      configCache = config;
-      lastLoadTime = Date.now();
-      
-    } else if (mode === 'env') {
-      throw new Error('Cannot save config in ENV mode - environment variables are read-only');
-      
-    } else {
-      // Local file mode
-      // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
-      const fs = require('fs');
-      // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
-      const path = require('path');
-      const configPath = path.join(process.cwd(), 'lib', 'json', 'appconfig.json');
-      
       // Write to file with pretty formatting
-      fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');
+      fs.writeFileSync(configPath, configJson, 'utf-8');
       
-      console.log('[Config] Saved to local file');
+      console.log('[Config] ✓ Saved to local file:', configPath);
       
       // Update cache
       configCache = config;
-      lastLoadTime = Date.now();
+      configInitialized = true;
+      
+      return {
+        success: true,
+        mode: 'local',
+        configJson,
+        instructions: '✓ Config saved to local file. Changes applied immediately in development mode.'
+      };
     }
   } catch (error) {
     console.error('[Config] Failed to save:', error);
@@ -282,49 +313,15 @@ export async function saveAppConfig(config: AppConfigJson): Promise<void> {
 }
 
 /**
- * Load configuration asynchronously from Blob Storage
- * Use this in API routes for live config updates
- * IMPORTANT: On Vercel with blob storage, always use this for fresh data
+ * Load configuration asynchronously - DEPRECATED
+ * 
+ * This function is kept for backward compatibility but now just calls loadAppConfig().
+ * We no longer read from Blob Storage to avoid runtime costs.
+ * 
+ * @deprecated Use loadAppConfig() instead. This function no longer reads from blob storage.
  */
 export async function loadAppConfigAsync(forceReload = false): Promise<AppConfigJson> {
-  const now = Date.now();
-  
-  // Return cached config if still valid (unless force reload)
-  if (!forceReload && configCache && (now - lastLoadTime) < CACHE_TTL) {
-    return configCache;
-  }
-
-  const mode = getStorageMode();
-
-  try {
-    if (mode === 'blob' && isNodeEnvironment()) {
-      // Load from Vercel Blob Storage
-      const { list } = await import('@vercel/blob');
-      const { blobs } = await list({ prefix: 'appconfig.json', limit: 1 });
-      
-      if (blobs.length > 0) {
-        const response = await fetch(blobs[0].url);
-        if (!response.ok) {
-          throw new Error(`Failed to fetch blob: ${response.status} ${response.statusText}`);
-        }
-        
-        const config = await response.json() as AppConfigJson;
-        
-        // Update cache
-        configCache = config;
-        lastLoadTime = now;
-        
-        console.log('[Config] Loaded from Blob Storage:', blobs[0].url);
-        return config;
-      } else {
-        console.warn('[Config] No blob found for appconfig.json, using static config');
-      }
-    }
-  } catch (error) {
-    console.error('[Config] Error loading from blob, using fallback:', error);
-  }
-
-  // Fallback to sync load
+  console.warn('[Config] loadAppConfigAsync is deprecated - using loadAppConfig (zero cost mode)');
   return loadAppConfig(forceReload);
 }
 
@@ -373,5 +370,60 @@ export function requiresRestart(configKey: string): boolean {
  */
 export function clearConfigCache(): void {
   configCache = null;
-  lastLoadTime = 0;
+  configInitialized = false;
+  console.log('[Config] Cache cleared - will reload on next access');
+}
+
+/**
+ * Manually load configuration from Blob Storage (costs 1-2 read operations)
+ * Use this ONLY when you want to fetch the latest config from blob storage.
+ * Normal operations should use loadAppConfig() which costs nothing.
+ * 
+ * Use case: Admin panel "Reload from Blob" button
+ */
+export async function loadFromBlobStorage(): Promise<{
+  success: boolean;
+  config?: AppConfigJson;
+  blobUrl?: string;
+  error?: string;
+}> {
+  if (!isNodeEnvironment()) {
+    return { success: false, error: 'Only available in Node.js environment' };
+  }
+
+  try {
+    const { list } = await import('@vercel/blob');
+    const { blobs } = await list({ prefix: 'appconfig.json', limit: 1 });
+    
+    if (blobs.length === 0) {
+      return { 
+        success: false, 
+        error: 'No config found in blob storage. Save config first.' 
+      };
+    }
+
+    const response = await fetch(blobs[0].url);
+    if (!response.ok) {
+      return { 
+        success: false, 
+        error: `Failed to fetch blob: ${response.status} ${response.statusText}` 
+      };
+    }
+    
+    const config = await response.json() as AppConfigJson;
+    
+    console.log('[Config] ✓ Loaded from Blob Storage (manual fetch):', blobs[0].url);
+    
+    return {
+      success: true,
+      config,
+      blobUrl: blobs[0].url
+    };
+  } catch (error) {
+    console.error('[Config] Error loading from blob storage:', error);
+    return { 
+      success: false, 
+      error: error instanceof Error ? error.message : 'Unknown error' 
+    };
+  }
 }

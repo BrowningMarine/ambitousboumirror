@@ -8,7 +8,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "analyze": "cross-env NODE_OPTIONS=--max_old_space_size=4096 ANALYZE=true next build"
+    "analyze": "cross-env NODE_OPTIONS=--max_old_space_size=4096 ANALYZE=true next build",
+    "config:env": "node scripts/generate-env-config.js",
+    "config:env:minify": "node scripts/generate-env-config.js --minify"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",

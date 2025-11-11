@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { loadAppConfig, loadAppConfigAsync, saveAppConfig } from "@/lib/json/config-loader";
+import { loadAppConfig, saveAppConfig } from "@/lib/json/config-loader";
 
 // Simple in-memory rate limiter for authentication attempts
 const authAttempts = new Map<string, { count: number; resetAt: number }>();
@@ -79,8 +79,9 @@ export async function GET(
       );
     }
 
-    // Load config from blob storage if available (ensures fresh data)
-    const config = await loadAppConfigAsync(true);
+    // Load config from cache (zero cost)
+    // Note: This reads from environment variable or static import, NOT blob storage
+    const config = loadAppConfig();
     
     // Encode the config data as Base64 for additional security
     const configString = JSON.stringify(config);
@@ -88,7 +89,8 @@ export async function GET(
     
     return NextResponse.json({ 
       data: encodedConfig,
-      encoded: true 
+      encoded: true,
+      source: 'cache' // Indicates zero-cost read
     });
   } catch (error) {
     console.error('Error loading config:', error);
@@ -175,9 +177,9 @@ export async function POST(
         );
       }
 
-      // Save config (now async)
+      // Save config (now async, returns detailed response)
       try {
-        await saveAppConfig(config);
+        const saveResult = await saveAppConfig(config);
         console.log(`Config saved by IP: ${ip}`);
         
         // Check if restart is required
@@ -193,7 +195,9 @@ export async function POST(
         return NextResponse.json({ 
           success: true,
           requiresRestart,
-          changedFields
+          changedFields,
+          // Include save result details for zero-cost workflow
+          saveDetails: saveResult
         });
       } catch (saveError) {
         console.error('Error saving config:', saveError);
