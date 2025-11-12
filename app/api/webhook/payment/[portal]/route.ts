@@ -1240,28 +1240,41 @@ async function processUniversalTransaction(
         if (cachedWebhookData.urlCallback) {
           try {
             const { sendWebhookNotification } = await import('@/utils/webhook');
+            const { isWebhookCallbackBatchingEnabled } = await import('@/lib/appconfig');
             
+            // Prepare webhook data
             const callbackPayload = {
               odrId: odrId,
               merchantOrdId: cachedWebhookData.merchantOrdId || '',
+              orderType: cachedWebhookData.orderType,
               odrStatus: 'completed',
-              odrType: cachedWebhookData.orderType,
-              amount: Math.abs(normalizedTx.amount),
-              paidAmount: Math.abs(normalizedTx.amount),
-              bankAccountNumber: normalizedTx.accountNumber,
-              bankAccountName: cachedWebhookData.bankReceiveOwnerName || cachedWebhookData.accountName || '',
-              transactionId: portalTransactionId,
-              transactionNote: normalizedTx.description,
-              completedAt: new Date().toISOString()
+              bankReceiveNumber: normalizedTx.accountNumber,
+              bankReceiveOwnerName: cachedWebhookData.bankReceiveOwnerName || cachedWebhookData.accountName || '',
+              amount: Math.abs(normalizedTx.amount)
             };
             
-            await sendWebhookNotification(
-              cachedWebhookData.urlCallback,
-              callbackPayload,
-              cachedWebhookData.apiKey,
-              true,
-              'webhook-fallback-mode'
-            );
+            // Check webhook batching config to determine format
+            const batchingEnabled = isWebhookCallbackBatchingEnabled();
+            
+            if (batchingEnabled) {
+              // BATCHING MODE: Send as array (even for single item)
+              await sendWebhookNotification(
+                cachedWebhookData.urlCallback,
+                [callbackPayload] as unknown as Record<string, unknown>,
+                cachedWebhookData.apiKey,
+                true,
+                'webhook-fallback-batch'
+              );
+            } else {
+              // PARALLEL MODE: Send as single object (legacy behavior)
+              await sendWebhookNotification(
+                cachedWebhookData.urlCallback,
+                callbackPayload,
+                cachedWebhookData.apiKey,
+                true,
+                'webhook-fallback-single'
+              );
+            }
             
             // Mark callback as sent
             await markCallbackSent(odrId);

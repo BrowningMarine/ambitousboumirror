@@ -111,7 +111,7 @@
   },
   "databaseSettings": {
     "supabaseOrderPrefix": "EDO",
-    "coreRunningMode": "fallback",
+    "coreRunningMode": "appwrite",
     "availableModes": [
       "auto",
       "appwrite",

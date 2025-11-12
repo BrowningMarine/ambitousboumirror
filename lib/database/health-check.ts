@@ -222,11 +222,16 @@ async function performSupabaseHealthCheck(cacheKey: string): Promise<boolean> {
 /**
  * Determine which database to use based on health status and configuration
  * Returns 'appwrite' | 'supabase' | 'none'
+ * Uses fresh config data to ensure mode changes take effect immediately
  */
 export async function selectHealthyDatabase(): Promise<'appwrite' | 'supabase' | 'none'> {
   // Import dynamically to avoid circular dependency
-  const { getCoreRunningMode, getDatabasePriority } = await import('@/lib/appconfig');
-  const runningMode = getCoreRunningMode();
+  const { getDatabasePriority } = await import('@/lib/appconfig');
+  const { loadAppConfigAsync } = await import('@/lib/json/config-loader');
+  
+  // Force fresh config load to ensure mode changes are reflected immediately
+  const config = await loadAppConfigAsync(true);
+  const runningMode = config.databaseSettings?.coreRunningMode || 'auto';
 
   // Mode 0: Fallback Only - no database writes, use config only
   if (runningMode === 'fallback') {

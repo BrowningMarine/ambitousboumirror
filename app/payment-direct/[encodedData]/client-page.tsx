@@ -1030,13 +1030,6 @@ export default function ClientOnlyPaymentPage({
                 Trong khi chuyển khoản{" "}
                 <span className="font-bold">không làm mới trình duyệt.</span>
               </li>
-              {isFallbackMode && (
-                <li className="text-yellow-600 font-bold">
-                  ⚠️ Trang này hoạt động ở chế độ độc lập (fallback mode). Không
-                  có cập nhật trạng thái tự động từ database. Vui lòng kiểm tra
-                  email hoặc thông báo callback để xác nhận thanh toán.
-                </li>
-              )}
             </ol>
           </div>
 

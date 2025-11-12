@@ -522,7 +522,34 @@ export async function POST(
     }
 
     // Step 2: Request normalization
-    const requestData = await request.json();
+    let requestData;
+    
+    try {
+      requestData = await request.json();
+    } catch (jsonError) {
+      console.error('❌ [JSON Parse Error]', {
+        merchant: publicTransactionId,
+        error: jsonError instanceof Error ? jsonError.message : String(jsonError),
+        stack: jsonError instanceof Error ? jsonError.stack?.split('\n').slice(0, 3).join('\n') : undefined
+      });
+      
+      await log.error('POST orders: Invalid JSON in request body', 
+        jsonError instanceof Error ? jsonError : new Error(String(jsonError)), {
+        merchantId: publicTransactionId,
+        clientIp,
+        errorMessage: jsonError instanceof Error ? jsonError.message : String(jsonError)
+      });
+      
+      return NextResponse.json(
+        { 
+          success: false, 
+          message: 'Invalid JSON in request body. Make sure all URLs are properly quoted in double quotes. Example: "urlCallBack": "https://example.com"',
+          error: jsonError instanceof Error ? jsonError.message : String(jsonError)
+        },
+        { status: 400 }
+      );
+    }
+    
     let ordersArray: CreateOrderData[] = [];
     let isOriginallyArray = false;
     let globalSettings: {
@@ -703,10 +730,45 @@ export async function POST(
     
     // JSON Fallback mode (only if both databases are unhealthy and cache miss)
     if (!merchantAccount && healthyDatabase === 'none') {
+      console.log('🟡 [Fallback Mode] Merchant not found in cache, using JSON fallback validation', {
+        merchantId: publicTransactionId,
+        clientIp,
+        apiKeyPrefix: apiKey.substring(0, 8) + '...'
+      });
+      
       // Fallback 2: Both databases unhealthy - use JSON fallback
-      const fallbackResult = validateMerchantFallback(apiKey, clientIp, 'deposit');
+      let fallbackResult;
+      
+      try {
+        fallbackResult = validateMerchantFallback(apiKey, clientIp, 'deposit');
+      } catch (fallbackError) {
+        console.error('❌ [Fallback Validation Error]', {
+          merchant: publicTransactionId,
+          error: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+          stack: fallbackError instanceof Error ? fallbackError.stack : undefined
+        });
+        
+        await log.error('POST orders: Fallback validation threw error', 
+          fallbackError instanceof Error ? fallbackError : new Error(String(fallbackError)), {
+          merchantId: publicTransactionId,
+          clientIp,
+          database: 'json-fallback'
+        });
+        
+        return NextResponse.json(
+          { success: false, message: 'Validation system temporarily unavailable' },
+          { status: 503 }
+        );
+      }
       
       if (!fallbackResult.success) {
+        console.error('❌ [Fallback Validation Failed]', {
+          merchant: publicTransactionId,
+          clientIp,
+          error: fallbackResult.error,
+          apiKeyPrefix: apiKey.substring(0, 8) + '...'
+        });
+        
         const requestDetails = await captureRequestDetails(request);
         await log.warn('POST orders: Fallback validation failed', { 
           merchantId: publicTransactionId,
@@ -715,15 +777,44 @@ export async function POST(
           database: 'json-fallback',
           error: fallbackResult.error
         });
+        
         return NextResponse.json(
-          { success: false, message: fallbackResult.error || 'Invalid API key or account' },
+          { 
+            success: false, 
+            message: fallbackResult.error || 'Invalid API key or account',
+            debug: {
+              clientIp: clientIp,
+              reason: fallbackResult.error
+            }
+          },
           { status: 401 }
         );
       }
       
       // Get merchant limits from fallback
-      const limits = getMerchantLimitsFallback(fallbackResult.merchantId!, 'deposit');
-      const withdrawLimits = getMerchantLimitsFallback(fallbackResult.merchantId!, 'withdraw');
+      let limits, withdrawLimits;
+      
+      try {
+        limits = getMerchantLimitsFallback(fallbackResult.merchantId!, 'deposit');
+        withdrawLimits = getMerchantLimitsFallback(fallbackResult.merchantId!, 'withdraw');
+      } catch (limitsError) {
+        console.error('❌ [Fallback Limits Error]', {
+          merchant: fallbackResult.merchantId,
+          error: limitsError instanceof Error ? limitsError.message : String(limitsError)
+        });
+        
+        await log.error('POST orders: Failed to get merchant limits from fallback', 
+          limitsError instanceof Error ? limitsError : new Error(String(limitsError)), {
+          merchantId: publicTransactionId,
+          clientIp,
+          database: 'json-fallback'
+        });
+        
+        return NextResponse.json(
+          { success: false, message: 'Configuration temporarily unavailable' },
+          { status: 503 }
+        );
+      }
       
       // Create merchant account from fallback data
       merchantAccount = {
@@ -1074,10 +1165,28 @@ export async function POST(
 
   } catch (error) {
     const totalTime = performance.now() - requestStartTime;
-    await log.error('POST orders: Processing error', error instanceof Error ? error : new Error(String(error)), {
+    
+    // Enhanced error logging with full error details
+    const errorDetails = {
       merchantId: publicTransactionId,
       totalTime: Math.round(totalTime),
-      clientIp
+      clientIp,
+      errorName: error instanceof Error ? error.name : 'Unknown',
+      errorMessage: error instanceof Error ? error.message : String(error),
+      errorStack: error instanceof Error ? error.stack : undefined,
+      healthyDatabase: await selectHealthyDatabase().catch(() => 'unknown')
+    };
+    
+    await log.error('POST orders: Processing error', 
+      error instanceof Error ? error : new Error(String(error)), 
+      errorDetails
+    );
+    
+    // Log to console for immediate debugging
+    console.error('❌ [Order Creation Error]', {
+      merchant: publicTransactionId,
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack?.split('\n').slice(0, 3).join('\n') : undefined
     });
     
     return NextResponse.json(

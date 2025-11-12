@@ -409,7 +409,17 @@ export function getAllMerchants(): Record<string, MerchantConfig> {
  */
 export function getBankConfig(bankId: string): BankConfig | null {
   const config = loadAppConfig();
-  return config.banks[bankId] || null;
+  
+  // First try direct key lookup (for backward compatibility)
+  if (config.banks[bankId]) {
+    return config.banks[bankId];
+  }
+  
+  // Search by bankId field within bank objects
+  const banks = Object.values(config.banks);
+  const bank = banks.find((b: BankConfig) => b.bankId === bankId);
+  
+  return bank || null;
 }
 
 /**
