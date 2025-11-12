@@ -1133,7 +1133,16 @@ async function processUniversalTransaction(
   try {
     // Phase 0: Check database mode configuration
     const { getCoreRunningMode } = await import('@/lib/appconfig');
-    const runningMode = getCoreRunningMode();
+    const runningMode = getCoreRunningMode() as 'auto' | 'appwrite' | 'supabase' | 'fallback';
+    
+    // Check actual healthy database (especially important in 'auto' mode)
+    let healthyDatabase: 'appwrite' | 'supabase' | 'none' = 'appwrite';
+    if (runningMode === 'auto' || runningMode === 'fallback') {
+      const { selectHealthyDatabase } = await import('@/lib/database/health-check');
+      healthyDatabase = await selectHealthyDatabase();
+    } else {
+      healthyDatabase = runningMode as 'appwrite' | 'supabase';
+    }
     
     // Phase 1: Data validation and normalization
     const validationStart = performance.now();
@@ -1155,7 +1164,134 @@ async function processUniversalTransaction(
     }
     processingMetrics.dataValidation = performance.now() - validationStart;
     
+    // FALLBACK MODE: Skip all database lookups entirely (when no healthy database available)
+    if (runningMode === 'fallback' || healthyDatabase === 'none') {
+      // Extract order ID from description (no database lookup)
+      const odrId = portal === 'secretagent' 
+        ? (transaction as SecretAgentTransaction).odrId
+        : extractOrderIdOptimized(normalizedTx.description);
+      
+      if (!odrId) {
+        processingMetrics.total = performance.now() - txStartTime;
+        return {
+          id: normalizedTx.id,
+          status: 'failed',
+          message: 'Order ID not found in transaction description',
+          metrics: processingMetrics
+        };
+      }
+      
+      // Only process positive amounts (credit transactions)
+      if (normalizedTx.amount <= 0) {
+        processingMetrics.total = performance.now() - txStartTime;
+        return {
+          id: normalizedTx.id,
+          status: 'failed',
+          message: 'Negative or zero amount transaction rejected',
+          metrics: processingMetrics
+        };
+      }
+      
+      // Try to get cached webhook data
+      try {
+        const { getFallbackWebhookData } = await import('@/lib/cache/webhook-fallback-cache');
+        const cachedWebhookData = await getFallbackWebhookData(odrId);
+        
+        if (!cachedWebhookData) {
+          processingMetrics.total = performance.now() - txStartTime;
+          return {
+            id: normalizedTx.id,
+            status: 'failed',
+            message: 'Order not found in cache (may have expired)',
+            metrics: processingMetrics
+          };
+        }
+        
+        const { markOrderCompleted, hasCallbackBeenSent, markCallbackSent } = 
+          await import('@/lib/cache/fallback-order-cache');
+        
+        // Mark order as completed in Redis
+        const marked = await markOrderCompleted(odrId, Math.abs(normalizedTx.amount));
+        
+        if (!marked) {
+          processingMetrics.total = performance.now() - txStartTime;
+          return {
+            id: normalizedTx.id,
+            status: 'failed',
+            message: 'Failed to update order status in cache',
+            metrics: processingMetrics
+          };
+        }
+        
+        // Check if callback already sent (prevent duplicates)
+        const alreadySent = await hasCallbackBeenSent(odrId);
+        
+        if (alreadySent) {
+          processingMetrics.total = performance.now() - txStartTime;
+          return {
+            id: normalizedTx.id,
+            status: 'processed',
+            message: 'Payment processed (callback already sent)',
+            metrics: processingMetrics
+          };
+        }
+        
+        // Send merchant callback if URL exists
+        if (cachedWebhookData.urlCallback) {
+          try {
+            const { sendWebhookNotification } = await import('@/utils/webhook');
+            
+            const callbackPayload = {
+              odrId: odrId,
+              merchantOrdId: cachedWebhookData.merchantOrdId || '',
+              odrStatus: 'completed',
+              odrType: cachedWebhookData.orderType,
+              amount: Math.abs(normalizedTx.amount),
+              paidAmount: Math.abs(normalizedTx.amount),
+              bankAccountNumber: normalizedTx.accountNumber,
+              bankAccountName: cachedWebhookData.bankReceiveOwnerName || cachedWebhookData.accountName || '',
+              transactionId: portalTransactionId,
+              transactionNote: normalizedTx.description,
+              completedAt: new Date().toISOString()
+            };
+            
+            await sendWebhookNotification(
+              cachedWebhookData.urlCallback,
+              callbackPayload,
+              cachedWebhookData.apiKey,
+              true,
+              'webhook-fallback-mode'
+            );
+            
+            // Mark callback as sent
+            await markCallbackSent(odrId);
+          } catch {
+            // Don't fail the webhook - payment was processed successfully
+          }
+        }
+        
+        processingMetrics.total = performance.now() - txStartTime;
+        return {
+          id: normalizedTx.id,
+          status: 'processed',
+          message: 'Payment processed successfully in fallback mode',
+          odrId: odrId,
+          metrics: processingMetrics
+        };
+        
+      } catch {
+        processingMetrics.total = performance.now() - txStartTime;
+        return {
+          id: normalizedTx.id,
+          status: 'failed',
+          message: 'Cache operation failed',
+          metrics: processingMetrics
+        };
+      }
+    }
+    
     // Phase 2: Parallel lookup operations (duplicate check, bank lookup, order ID extraction)
+    // ONLY executed in appwrite/supabase modes
     const lookupStart = performance.now();
     let isDuplicate: boolean;
     let odrId: string | null;
@@ -1208,57 +1344,6 @@ async function processUniversalTransaction(
         id: normalizedTx.id,
         status: 'failed',
         message: bankResult.message || `Bank account not found in ${portal} transfer`,
-        metrics: processingMetrics
-      };
-    }
-
-    // FALLBACK MODE: Try to get cached webhook data, then skip database operations
-    if (runningMode === 'fallback') {
-      console.log('🟡 [Webhook Fallback Mode] Transaction received but not saved to database:', {
-        portal,
-        txId: normalizedTx.id,
-        odrId: odrId || 'UNKNOWN',
-        amount: normalizedTx.amount,
-        accountNumber: normalizedTx.accountNumber,
-        description: normalizedTx.description.substring(0, 100)
-      });
-      
-      // TRY: Get cached webhook data for merchant notification
-      let cachedWebhookData = null;
-      if (odrId) {
-        try {
-          const { getFallbackWebhookData } = await import('@/lib/cache/webhook-fallback-cache');
-          cachedWebhookData = await getFallbackWebhookData(odrId);
-          
-          if (cachedWebhookData) {
-            console.log('✅ [Fallback Mode] Found cached webhook data - will send merchant notification');
-          } else {
-            console.warn('⚠️ [Fallback Mode] No cached webhook data - merchant notification cannot be sent');
-          }
-        } catch (error) {
-          console.error('❌ [Fallback Mode] Error accessing webhook cache:', error);
-        }
-      }
-      
-      processingMetrics.total = performance.now() - txStartTime;
-      return {
-        id: normalizedTx.id,
-        status: 'processed',
-        bankId: bankResult.bank.bankId,
-        odrId: odrId || null,
-        amount: normalizedTx.amount,
-        // Include cached data if available
-        url_callback: cachedWebhookData?.urlCallback,
-        merchantOrdId: cachedWebhookData?.merchantOrdId,
-        orderType: cachedWebhookData?.orderType,
-        odrStatus: 'processing', // In fallback, we assume processing
-        bankReceiveNumber: cachedWebhookData?.bankReceiveNumber || cachedWebhookData?.accountNumber,
-        bankReceiveOwnerName: cachedWebhookData?.bankReceiveOwnerName || cachedWebhookData?.accountName,
-        paidAmount: Math.abs(normalizedTx.amount),
-        apiKey: cachedWebhookData?.apiKey,
-        message: cachedWebhookData 
-          ? 'Fallback mode - using cached data for merchant notification'
-          : 'Fallback mode - no cached data, merchant notification skipped',
         metrics: processingMetrics
       };
     }

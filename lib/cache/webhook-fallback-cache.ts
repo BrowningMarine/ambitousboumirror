@@ -88,10 +88,11 @@ export async function cacheFallbackWebhookData(data: FallbackWebhookData): Promi
     if (redis) {
       try {
         // Store in Redis with 24-hour expiration
-        await redis.setex(
+        // Upstash Redis auto-serializes objects, so pass data directly (no JSON.stringify)
+        await redis.set(
           `webhook:${key}`,
-          86400, // 24 hours in seconds
-          JSON.stringify(data)
+          data, // Pass object directly, Upstash will serialize
+          { ex: 86400 } // 24 hours in seconds
         );
         console.log(`✅ [Hybrid Cache] Cached webhook data (L1+L2) for order ${data.odrId}`);
       } catch (redisError) {
@@ -126,9 +127,10 @@ export async function getFallbackWebhookData(odrId: string): Promise<FallbackWeb
     const redis = getRedisClient();
     if (redis) {
       try {
-        const redisData = await redis.get<string>(`webhook:${odrId}`);
+        // Upstash Redis returns deserialized objects directly
+        const redisData = await redis.get<FallbackWebhookData>(`webhook:${odrId}`);
         if (redisData) {
-          data = JSON.parse(redisData) as FallbackWebhookData;
+          data = redisData; // Already deserialized by Upstash
           
           // Populate L1 cache for next access
           fallbackWebhookCache.set(odrId, data);

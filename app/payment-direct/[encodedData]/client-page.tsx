@@ -140,6 +140,8 @@ export default function ClientOnlyPaymentPage({
   useEffect(() => {
     if (!paymentData?.odrId) return;
 
+    let pollInterval: NodeJS.Timeout | null = null;
+
     // Check if we're in fallback mode via config
     const checkFallbackMode = async () => {
       try {
@@ -148,15 +150,50 @@ export default function ClientOnlyPaymentPage({
 
         // If fallback mode, skip database queries entirely
         if (config.mode === "fallback") {
-          console.log(
-            "🟡 [Payment-Direct] Fallback mode - skipping database status check"
-          );
           setIsFallbackMode(true);
           setStatusLoaded(true);
-          return;
+
+          // Start polling fallback status API for Redis-based status updates
+          pollInterval = setInterval(async () => {
+            try {
+              const statusRes = await fetch(
+                `/api/fallback-status/${paymentData.odrId}`
+              );
+              if (statusRes.ok) {
+                const statusData = await statusRes.json();
+                if (
+                  statusData.success &&
+                  statusData.odrStatus === "completed"
+                ) {
+                  // Update payment data with completed status
+                  setPaymentData((prevData) => {
+                    if (!prevData) return null;
+                    return {
+                      ...prevData,
+                      odrStatus: "completed",
+                    };
+                  });
+
+                  // Update effective status
+                  setEffectiveStatus("completed");
+
+                  // Set success notification
+                  setStatusChanged(true);
+                  setStatusMessage("Thanh toán đã hoàn thành thành công!");
+
+                  // Stop polling once completed
+                  if (pollInterval) clearInterval(pollInterval);
+                }
+              }
+            } catch {
+              // Silently handle errors
+            }
+          }, 5000); // Poll every 5 seconds
+
+          return; // Exit early for fallback mode - SKIP database fetch below
         }
 
-        // Otherwise, fetch status from database
+        // Database mode: fetch status from database
         const orderId = paymentData.odrId;
         const currentStatus = paymentData.odrStatus;
         const timestamp = paymentData.timestamp;
@@ -189,11 +226,27 @@ export default function ClientOnlyPaymentPage({
     };
 
     checkFallbackMode();
+
+    // Cleanup: Clear polling interval when component unmounts or odrId changes
+    return () => {
+      if (pollInterval) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+      }
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paymentData?.odrId]); // Only run once when order ID is available
 
   // Set up realtime subscription for order status updates (skip in fallback mode)
   useEffect(() => {
+    // Skip entirely if we're in fallback mode
+    if (isFallbackMode) {
+      console.log(
+        "🟡 [Payment-Direct] Fallback mode active - skipping realtime subscription"
+      );
+      return;
+    }
+
     // Only subscribe if we have payment data and it's in processing/pending status
     if (
       paymentData?.odrId &&
@@ -201,70 +254,55 @@ export default function ClientOnlyPaymentPage({
         paymentData.odrStatus === "pending") &&
       !unsubscribeRef.current
     ) {
-      // Check if we're in fallback mode first
-      fetch("/api/realtime-config")
-        .then((res) => res.json())
-        .then((config) => {
-          // If fallback mode, skip subscription entirely
-          if (config.mode === "fallback") {
-            console.log(
-              "🟡 [Payment-Direct] Fallback mode - skipping realtime subscription (no database)"
-            );
-            setIsFallbackMode(true);
-            return;
-          }
+      // Subscribe to realtime for this order (database mode only)
+      console.log(
+        "� [Payment-Direct] Setting up realtime subscription for order:",
+        paymentData.odrId
+      );
 
-          // Otherwise, subscribe to realtime for this order
-          const unsubscribe = subscribeToOrderChanges(
-            paymentData.odrId,
-            (updatedOrder: BackupOrder) => {
-              // Order status changed in database
-              if (updatedOrder.odr_status !== paymentData.odrStatus) {
-                setPaymentData((prevData) => {
-                  if (!prevData) return null;
+      const unsubscribe = subscribeToOrderChanges(
+        paymentData.odrId,
+        (updatedOrder: BackupOrder) => {
+          // Order status changed in database
+          if (updatedOrder.odr_status !== paymentData.odrStatus) {
+            setPaymentData((prevData) => {
+              if (!prevData) return null;
 
-                  return {
-                    ...prevData,
-                    odrStatus: updatedOrder.odr_status,
-                  };
-                });
+              return {
+                ...prevData,
+                odrStatus: updatedOrder.odr_status,
+              };
+            });
 
-                // Update effective status
-                if (updatedOrder.odr_status === "pending") {
-                  setEffectiveStatus("expired");
-                } else {
-                  setEffectiveStatus(updatedOrder.odr_status);
-                }
-
-                // Set notification based on new status
-                setStatusChanged(true);
-
-                if (updatedOrder.odr_status === "completed") {
-                  setStatusMessage("Thanh toán đã hoàn thành thành công!");
-                } else if (updatedOrder.odr_status === "failed") {
-                  setStatusMessage("Thanh toán đã thất bại. Vui lòng thử lại.");
-                } else if (updatedOrder.odr_status === "canceled") {
-                  setStatusMessage("Thanh toán đã bị hủy.");
-                } else if (updatedOrder.odr_status === "pending") {
-                  setStatusMessage(
-                    "Đơn hàng đã được cập nhật, nhưng đã hết thời gian thanh toán."
-                  );
-                }
-              }
-            },
-            () => {
-              // Error handler - silently ignore realtime errors
+            // Update effective status
+            if (updatedOrder.odr_status === "pending") {
+              setEffectiveStatus("expired");
+            } else {
+              setEffectiveStatus(updatedOrder.odr_status);
             }
-          );
 
-          unsubscribeRef.current = unsubscribe;
-        })
-        .catch(() => {
-          // Config fetch failed - assume not fallback mode and try subscribing anyway
-          console.warn(
-            "[Payment-Direct] Failed to check mode - attempting subscription"
-          );
-        });
+            // Set notification based on new status
+            setStatusChanged(true);
+
+            if (updatedOrder.odr_status === "completed") {
+              setStatusMessage("Thanh toán đã hoàn thành thành công!");
+            } else if (updatedOrder.odr_status === "failed") {
+              setStatusMessage("Thanh toán đã thất bại. Vui lòng thử lại.");
+            } else if (updatedOrder.odr_status === "canceled") {
+              setStatusMessage("Thanh toán đã bị hủy.");
+            } else if (updatedOrder.odr_status === "pending") {
+              setStatusMessage(
+                "Đơn hàng đã được cập nhật, nhưng đã hết thời gian thanh toán."
+              );
+            }
+          }
+        },
+        () => {
+          // Error handler - silently ignore realtime errors
+        }
+      );
+
+      unsubscribeRef.current = unsubscribe;
     }
     // If payment is no longer processing/pending but we have an active subscription, unsubscribe
     else if (
@@ -283,7 +321,7 @@ export default function ClientOnlyPaymentPage({
         unsubscribeRef.current = null;
       }
     };
-  }, [paymentData?.odrId, paymentData?.odrStatus]);
+  }, [paymentData?.odrId, paymentData?.odrStatus, isFallbackMode]);
 
   // Optimized countdown timer using the utility function
   useEffect(() => {

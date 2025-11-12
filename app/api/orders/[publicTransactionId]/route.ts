@@ -1186,33 +1186,54 @@ async function processSingleOrderOptimized(
 
     // OPTIMIZATION: Generate QR based on type - use local mode only (no URL fallback)
     if (data.odrType === 'deposit' && data.bankId) {
-      try {
-        const bankResult = await getBankById(data.bankId);
-        if (!bankResult.success || !bankResult.bank) {
-          // Automatic fallback: Use fallback bank data when lookup fails
-          console.warn(`Bank lookup failed: Using fallback bank data for bankId: ${data.bankId}`);
+      // Respect health check: Only query database if it's healthy
+      if (healthyDatabase === 'none') {
+        // Fallback mode: Load bank directly from JSON config (no database query)
+        console.log(`🟡 [Fallback Mode] Loading bank from JSON config for bankId: ${data.bankId}`);
+        const { getBankConfig } = await import('@/lib/json/config-loader');
+        const bankConfig = getBankConfig(data.bankId);
+        
+        if (bankConfig) {
+          console.log(`✅ [JSON Fallback] Found bank in appconfig.json: ${bankConfig.bankName}`);
+          bank = {
+            $id: data.bankId,
+            bankId: bankConfig.bankId,
+            bankName: bankConfig.bankName,
+            bankBinCode: bankConfig.bankBinCode,
+            accountNumber: bankConfig.accountNumber,
+            ownerName: bankConfig.ownerName,
+            isActivated: bankConfig.isActivated,
+            availableBalance: 0, // No balance tracking in fallback mode
+            currentBalance: 0,
+            realBalance: 0,
+            userId: undefined
+          };
+        } else {
+          // Final fallback: Use default fallback bank if not in JSON config
+          console.warn(`⚠️ [JSON Fallback] Bank ${data.bankId} not found in config, using default fallback`);
           bank = {
             $id: data.bankId,
             ...appConfig.fallbackBankData,
             bankId: data.bankId  // Override with actual bankId from request
           };
-        } else {
-          bank = bankResult.bank;
         }
-      } catch (error) {
-        console.error("Error fetching bank data:", {
-          error,
-          errorMessage: error instanceof Error ? error.message : 'Unknown error',
-          bankId: data.bankId
-        });
-        
-        // Automatic fallback: Use fallback bank data on database error
-        console.warn(`Database error: Using fallback bank data for bankId: ${data.bankId}`);
-        bank = {
-          $id: data.bankId,
-          ...appConfig.fallbackBankData,
-          bankId: data.bankId  // Override with actual bankId from request
-        };
+      } else {
+        // Database mode: Query from healthy database
+        try {
+          const bankResult = await getBankById(data.bankId);
+          if (!bankResult.success || !bankResult.bank) {
+            throw new Error(`Bank not found: ${data.bankId}`);
+          }
+          bank = bankResult.bank;
+        } catch (error) {
+          console.error("Error fetching bank from database:", {
+            error,
+            errorMessage: error instanceof Error ? error.message : 'Unknown error',
+            bankId: data.bankId,
+            database: healthyDatabase
+          });
+          throw error; // Don't fall back to JSON in database mode - fail fast
+        }
       }
       
       // OPTIMIZATION: Use QR Local directly (no try-catch overhead, no URL fallback)
@@ -1451,8 +1472,10 @@ async function processSingleOrderOptimized(
     if (healthyDatabase === 'none' && createdOrder.urlCallBack) {
       try {
         const { cacheFallbackWebhookData } = await import('@/lib/cache/webhook-fallback-cache');
+        const { cacheOrderState } = await import('@/lib/cache/fallback-order-cache');
         const apiKeyFromRequest = request.headers.get('x-api-key') || '';
         
+        // Cache webhook data for merchant callback
         await cacheFallbackWebhookData({
           odrId: createdOrder.odrId,
           merchantOrdId: createdOrder.merchantOrdId || '',
@@ -1467,10 +1490,22 @@ async function processSingleOrderOptimized(
           cachedAt: Date.now()
         });
         
-        console.log('✅ [Fallback Mode] Cached webhook data (L1+L2) for order:', createdOrder.odrId);
+        // Cache order state for payment page status checks
+        await cacheOrderState({
+          odrId: createdOrder.odrId,
+          odrStatus: 'processing',
+          amount: createdOrder.amount,
+          paidAmount: 0,
+          unpaidAmount: createdOrder.amount,
+          odrType: createdOrder.odrType,
+          merchantId: merchantAccount.publicTransactionId,
+          createdAt: Date.now()
+        });
+        
+        console.log('✅ [Fallback Mode] Cached webhook data + order state for order:', createdOrder.odrId);
       } catch (error) {
         // Cache failure shouldn't block order creation
-        console.error('⚠️ [Fallback Mode] Failed to cache webhook data:', error);
+        console.error('⚠️ [Fallback Mode] Failed to cache data:', error);
       }
     }
 
