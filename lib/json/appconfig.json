@@ -1,7 +1,7 @@
 {
   "_metadata": {
     "version": "2.0.0",
-    "lastModified": "2025-11-10T17:22:41.645Z",
+    "lastModified": "2025-11-13T07:37:56.168Z",
     "description": "Application configuration - controls core system behavior. Most settings here, secrets in .env",
     "requiresRestart": {
       "paymentEncryptionKey": true,
@@ -20,7 +20,7 @@
     "description": "API transactions management system",
     "icon": "/icons/logonew.svg",
     "siteUrl": "https://dev.thedreamforlife.online",
-    "paymentBaseUrl": "https://dev.thedreamforlife.online",
+    "paymentBaseUrl": "https://admin.thedreamforlife.online",
     "cookieName": "ambitousboy-session",
     "locales": [
       "en",
@@ -33,7 +33,7 @@
     "withdrawExportPassword": "FOux9fCv91mQaBx",
     "qrTemplateCode": "VE7bsvs",
     "createQrBy": "local",
-    "allowRegister": true,
+    "allowRegister": false,
     "trustedDomains": [
       "https://vietnam.infantry5.com",
       "https://thedreamforlife.online",
@@ -42,7 +42,12 @@
       "https://esomarvietnam.com",
       "https://www.esomarvietnam.com"
     ],
-    "allowAllFrameEmbedding": false
+    "allowAllFrameEmbedding": false,
+    "allowedDomains": [
+      "admin.thedreamforlife.online",
+      "api.thedreamforlife.online",
+      "localhost"
+    ]
   },
   "security": {
     "paymentEncryptionKey": "rHvgV8Y5tLcu21x0Pdv59bDg",
@@ -67,7 +72,7 @@
     "availableBalance": 49454429238
   },
   "merchants": {
-    "ESOMAR": {
+    "VMJvxjsNuc": {
       "apiKeyHash": "ea848cdf856564ed1f570cad08e0536364d3fc655074867c4c4af8b44a7d69c0",
       "accountId": "VMJvxjsNuc",
       "minDepositAmount": 500000,
@@ -90,7 +95,7 @@
     }
   },
   "banks": {
-    "EsomarDeptACB": {
+    "ETBJ08yEzt": {
       "bankId": "ETBJ08yEzt",
       "bankName": "ACB bank - Ngan hang TMCP A Chau",
       "bankBinCode": "970416",
@@ -110,7 +115,7 @@
     "requiresRestart": "Check _metadata.requiresRestart to see which changes need server restart"
   },
   "databaseSettings": {
-    "supabaseOrderPrefix": "EDO",
+    "supabaseOrderPrefix": "EMO",
     "coreRunningMode": "appwrite",
     "availableModes": [
       "auto",
@@ -124,16 +129,18 @@
       "supabase": "Use Supabase database only",
       "fallback": "No database writes - uses config fallback bank/merchant, validates by timestamp"
     },
-    "fallbackOrderPrefix": "FDO",
+    "fallbackOrderPrefix": "FBO",
     "databasePriority": [
       "appwrite",
       "supabase",
       "fallback"
     ],
-    "appwriteOrderPrefix": "ADO"
+    "appwriteOrderPrefix": "ABO"
   },
   "webhookSettings": {
     "enableCallbackBatching": true,
-    "description": "When true: batch multiple orders with same callback URL into one array request. When false: send separate parallel requests (legacy behavior)"
+    "depositWebhookMode": "legacy",
+    "withdrawWebhookMode": "batch",
+    "description": "Webhook notification modes per order type. enableCallbackBatching: legacy boolean (applies to all if deposit/withdrawWebhookMode not set). depositWebhookMode/withdrawWebhookMode: 'batch' (array format, groups by URL) or 'legacy' (separate requests)"
   }
 }

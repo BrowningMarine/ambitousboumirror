@@ -23,6 +23,7 @@ import { appConfig } from './lib/appconfig'
 import { allowFrameEmbedding } from './lib/middleware-helpers'
 import { getCookieDomain } from './lib/utils'
 import createIntlMiddleware from 'next-intl/middleware'
+import { loadAppConfigAsync } from './lib/json/config-loader'
 
 const limiter = new RateLimiter()
 const COOKIE_NAME = appConfig.cookie_name
@@ -34,14 +35,73 @@ const COOKIE_NAME = appConfig.cookie_name
 export const locales = appConfig.locales
 export const defaultLocale = appConfig.defaultLocale
 
-// Add blocked paths that should return 404  
-const blockedPaths = [
-  '/transaction-history',
-  ...(appConfig.allowRegister === 'false' ? [
-    '/sign-up',
-    ...locales.map(locale => `/${locale}/sign-up`)
-  ] : []),
-] as const
+// Cache for paths with 24-hour TTL (config rarely changes)
+// When admin saves config, this cache is cleared automatically
+let pathsCache: {
+  blockedPaths: string[];
+  publicPaths: string[];
+  timestamp: number;
+} | null = null;
+
+const PATHS_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+/**
+ * Clear middleware paths cache
+ * Called when config is saved to force immediate reload of allowRegister setting
+ */
+export function clearMiddlewarePathsCache(): void {
+  pathsCache = null;
+  console.log('[Middleware] Paths cache cleared - next request will reload from config');
+}
+
+// Helper to get blocked and public paths with caching (loads from Redis once per day)
+async function getCachedPaths(): Promise<{ blockedPaths: string[]; publicPaths: string[] }> {
+  const now = Date.now();
+  
+  // Return cached paths if still valid
+  if (pathsCache && (now - pathsCache.timestamp) < PATHS_CACHE_TTL) {
+    // Cache hit - no Redis call needed (99.9% of requests)
+    return {
+      blockedPaths: pathsCache.blockedPaths,
+      publicPaths: pathsCache.publicPaths
+    };
+  }
+  
+  // Cache expired or doesn't exist - load from Redis
+  console.log('[Middleware] Cache expired, loading paths from Redis...');
+  const config = await loadAppConfigAsync();
+  const allowRegister = config.baseSettings.allowRegister;
+  
+  const blockedPaths = [
+    '/transaction-history',
+    ...(allowRegister === false ? [
+      '/sign-up',
+      ...locales.map(locale => `/${locale}/sign-up`)
+    ] : []),
+  ];
+  
+  const publicPaths = [
+    '/sign-in',
+    ...(allowRegister === true ? ['/sign-up'] : []),
+    '/api',
+    '/icons',
+    '/payment',
+    '/payment-direct/',
+    '/webhook',
+    '/public',
+    '/transbot',
+    '/darkveil'
+  ];
+  
+  // Update cache
+  pathsCache = {
+    blockedPaths,
+    publicPaths,
+    timestamp: now
+  };
+  
+  return { blockedPaths, publicPaths };
+}
 
 // Static paths that don't need authentication checks  
 const staticPaths = [
@@ -58,10 +118,10 @@ const staticPaths = [
   '.ico'
 ] as const
 
-// Add paths that don't require authentication  
+// Add paths that don't require authentication
+// NOTE: This is static for initial load, but getPublicPaths() loads from Redis
 export const publicPaths = [
   '/sign-in',
-  ...(appConfig.allowRegister === 'true' ? ['/sign-up'] : []),
   '/api',
   '/icons',
   '/payment',
@@ -69,7 +129,7 @@ export const publicPaths = [
   '/webhook',
   '/public',
   '/transbot',
-  '/darkveil' // Allow all /darkveil/* paths (secret path validated in page component)
+  '/darkveil'
 ] as const
 
 export const internalApiPaths = [
@@ -77,6 +137,7 @@ export const internalApiPaths = [
   '/api/validate-payment',
   '/api/users/withdraw-status',
   '/api/resend-webhook',
+  '/api/resend-webhook-bulk',
   'api/webhook/resend-all-notifications',
   'api/webhook/resend-progress',
   'api/webhook/update-all-notifications',
@@ -232,6 +293,9 @@ export async function middleware(request: NextRequest) {
       return getRateLimitResponse(limit, remaining, reset)
     }
 
+    // Get dynamic paths from Redis (real-time config, cached for 60s)
+    const { blockedPaths, publicPaths: dynamicPublicPaths } = await getCachedPaths();
+
     // Check blocked paths first - return 404  
     if (isPathMatch(pathname, blockedPaths)) {
       const response = NextResponse.rewrite(new URL('/404', request.url))
@@ -309,7 +373,7 @@ export async function middleware(request: NextRequest) {
 
     // Check if it's a public path  
     const pathWithoutLocale = pathname.replace(/^\/[a-z]{2}(?=\/|$)/, '');
-    const isPublicPath = isPathMatch(pathWithoutLocale, publicPaths);
+    const isPublicPath = isPathMatch(pathWithoutLocale, dynamicPublicPaths);
 
     if (isPublicPath) {
       // Public paths don't need authentication

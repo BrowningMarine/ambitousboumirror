@@ -145,7 +145,7 @@ export default function ClientOnlyPaymentPage({
     // Check if we're in fallback mode via config
     const checkFallbackMode = async () => {
       try {
-        const response = await fetch("/api/realtime-config");
+        const response = await fetch("/api/realtime-verify");
         const config = await response.json();
 
         // If fallback mode, skip database queries entirely
@@ -605,7 +605,10 @@ export default function ClientOnlyPaymentPage({
 
           {/* Footer */}
           <div className="px-6 py-3 bg-gray-100 text-center text-xs text-gray-500">
-            <p>© 2025 {paymentData.merchantName} | Protected and Encrypted</p>
+            <p>
+              © {new Date().getFullYear()} {paymentData.merchantName} |
+              Protected and Encrypt
+            </p>
           </div>
         </div>
       </div>
@@ -680,7 +683,10 @@ export default function ClientOnlyPaymentPage({
           </div>
 
           <div className="px-6 py-3 bg-gray-100 text-center text-xs text-gray-500">
-            <p>© 2025 {paymentData.merchantName} | Protected and Encrypted</p>
+            <p>
+              © {new Date().getFullYear()} {paymentData.merchantName} |
+              Protected and Encrypted
+            </p>
           </div>
         </div>
       </div>
@@ -1035,7 +1041,10 @@ export default function ClientOnlyPaymentPage({
 
           {/* Footer */}
           <div className="px-6 py-3 bg-gray-100 text-center text-xs text-gray-500">
-            <p>© 2025 {paymentData.merchantName} | Protected and Encrypted</p>
+            <p>
+              © {new Date().getFullYear()} {paymentData.merchantName} |
+              Protected and Encrypted
+            </p>
           </div>
         </div>
       </div>

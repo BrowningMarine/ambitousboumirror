@@ -8,30 +8,63 @@ const TRANSACTION_LOG_COLLECTION_ID = appwriteConfig.logWebhookCollectionId;
 /**  
  * Sends a webhook notification to a specified URL  
  * @param url The callback URL to send the notification to  
- * @param data The data payload to send in the webhook  
+ * @param data The data payload to send in the webhook (single object or array)
  * @param apikey Optional API key for authorization  
+ * @param writelog Whether to write log to database
+ * @param sourceLog Source identifier for logging
  * @returns A promise that resolves to an object with success status and message  
  */
 export async function sendWebhookNotification(
   url: string,
-  data: Record<string, unknown>,
+  data: Record<string, unknown> | Array<Record<string, unknown>>,
   apikey?: string,
   writelog: boolean = true,
   sourceLog: string = 'webhook-notification'
 ) {
+  // Helper to extract first item's data for logging (array or single object)
+  const getFirstItem = (d: typeof data): Record<string, unknown> => {
+    return Array.isArray(d) ? (d[0] || {}) : d;
+  };
+  
+  const firstItem = getFirstItem(data);
+  const isArrayData = Array.isArray(data);
+  const itemCount = isArrayData ? data.length : 1;
+
   if (!url) {
-    // Log the failure
+    // IMPROVEMENT: Log failure separately for each order in batch
     if (writelog) {
-      await logWebhookTransaction({
-        success: false,
-        message: "Webhook URL not provided",
-        orderId: data.odrId as string || "",
-        orderReference: data.merchantOrdId as string || "",
-        status: data.odrStatus as string || "",
-        amount: typeof data.amount === 'number' ? data.amount : 0,
-        data: JSON.stringify({ error: "Webhook URL not provided" }),
-        source: sourceLog
-      });
+      if (isArrayData) {
+        // For batch: Log each order separately
+        const errorLogPromises = data.map((item, index) =>
+          logWebhookTransaction({
+            success: false,
+            message: "Webhook URL not provided",
+            orderId: item.odrId as string || "",
+            orderReference: item.merchantOrdId as string || "",
+            status: item.odrStatus as string || "",
+            amount: typeof item.amount === 'number' ? item.amount : 0,
+            data: JSON.stringify({ 
+              error: "Webhook URL not provided", 
+              batchSize: itemCount,
+              batchIndex: index + 1
+            }),
+            source: `${sourceLog}-batch-nourl`
+          })
+        );
+        await Promise.allSettled(errorLogPromises);
+      } else {
+        // For single order
+        await logWebhookTransaction({
+          success: false,
+          message: "Webhook URL not provided",
+          orderId: firstItem.odrId as string || "",
+          orderReference: firstItem.merchantOrdId as string || "",
+          status: firstItem.odrStatus as string || "",
+          amount: typeof firstItem.amount === 'number' ? firstItem.amount : 0,
+          data: JSON.stringify({ error: "Webhook URL not provided" }),
+          source: sourceLog
+        });
+      }
     }
 
     return {
@@ -48,6 +81,9 @@ export async function sendWebhookNotification(
     ...(apikey && { "x-api-key": apikey }),
   };
 
+  // Prepare logging info
+  const logOrderInfo = isArrayData ? `array[${itemCount}]` : (firstItem.odrId as string || 'unknown');
+
   try {
     // VERCEL OPTIMIZATION: Use shorter timeouts and connection limits for free tier
     const controller = new AbortController();
@@ -56,7 +92,7 @@ export async function sendWebhookNotification(
     const WEBHOOK_TIMEOUT = process.env.VERCEL ? 6000 : 12000;
     const timeoutId = setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT);
 
-    console.log(`Sending webhook notification to ${url} for order ${data.odrId || 'unknown'}`);
+    console.log(`Sending webhook notification to ${url} for ${logOrderInfo}`);
 
     // OPTIMIZATION: Add connection-specific timeout and improved headers
     const fetchOptions: RequestInit = {
@@ -92,32 +128,77 @@ export async function sendWebhookNotification(
     // Capture response headers  
     const responseHeaders = Object.fromEntries(response.headers.entries());
 
-    // Log the result
+    // IMPROVEMENT: Log separately for each order in batch (searchable by orderId)
     if (writelog) {
-      await logWebhookTransaction({
-        success: response.ok,
-        message: response.ok
-          ? `Webhook notification sent successfully (${response.status})`
-          : `Failed to send webhook notification. Status: ${response.status}`,
-        orderId: data.odrId as string || "",
-        orderReference: data.merchantOrdId as string || "",
-        status: data.odrStatus as string || "",
-        amount: typeof data.amount === 'number' ? data.amount : 0,
-        data: JSON.stringify({
-          requestUrl: url,
-          requestHeaders: headers,
-          requestBody: JSON.stringify(data),
-          responseStatus: response.status || 'unknown',
-          responseHeaders: responseHeaders || 'unknown',
-          responseBody: typeof parsedResponseBody === 'string' && parsedResponseBody.length > 100
-            ? parsedResponseBody.substring(0, 100) + '...'
-            : parsedResponseBody
-        }),
-        source: sourceLog
-      });
+      // Helper: Get partial API key (first 3 + last 3 chars)
+      const getPartialApiKey = (key?: string): string => {
+        if (!key) return '';
+        if (key.length <= 6) return '***';
+        return `${key.substring(0, 3)}...${key.substring(key.length - 3)}`;
+      };
+
+      if (isArrayData) {
+        // For batch/array: Create one log per order (searchable!)
+        const logPromises = data.map((item, index) => 
+          logWebhookTransaction({
+            success: response.ok,
+            message: response.ok
+              ? `Webhook sent successfully (${response.status})`
+              : `Webhook failed (${response.status})`,
+            orderId: item.odrId as string || "",
+            orderReference: item.merchantOrdId as string || "",
+            status: item.odrStatus as string || "",
+            amount: typeof item.amount === 'number' ? item.amount : 0,
+            data: JSON.stringify({
+              url: url,
+              method: "POST",
+              apiKey: getPartialApiKey(apikey),
+              status: response.status,
+              statusText: response.statusText,
+              // Only keep essential response body (first 200 chars)
+              responseBody: typeof parsedResponseBody === 'string' 
+                ? parsedResponseBody.substring(0, 200) 
+                : JSON.stringify(parsedResponseBody).substring(0, 200),
+              // Batch context
+              batchSize: itemCount,
+              batchIndex: index + 1
+            }),
+            source: `${sourceLog}-batch`
+          })
+        );
+        
+        // Log all in parallel (don't wait to avoid blocking)
+        await Promise.allSettled(logPromises);
+      } else {
+        // For single order: Keep detailed logging
+        await logWebhookTransaction({
+          success: response.ok,
+          message: response.ok
+            ? `Webhook notification sent successfully (${response.status})`
+            : `Failed to send webhook notification. Status: ${response.status}`,
+          orderId: firstItem.odrId as string || "",
+          orderReference: firstItem.merchantOrdId as string || "",
+          status: firstItem.odrStatus as string || "",
+          amount: typeof firstItem.amount === 'number' ? firstItem.amount : 0,
+          data: JSON.stringify({
+            requestUrl: url,
+            requestHeaders: {
+              ...headers,
+              'x-api-key': getPartialApiKey(apikey)
+            },
+            requestBody: JSON.stringify(data),
+            responseStatus: response.status || 'unknown',
+            responseHeaders: responseHeaders || 'unknown',
+            responseBody: typeof parsedResponseBody === 'string' && parsedResponseBody.length > 100
+              ? parsedResponseBody.substring(0, 100) + '...'
+              : parsedResponseBody
+          }),
+          source: sourceLog
+        });
+      }
     }
 
-    console.log(`Webhook notification ${response.ok ? 'succeeded' : 'failed'} for order ${data.odrId || 'unknown'}: ${response.status}`);
+    console.log(`Webhook notification ${response.ok ? 'succeeded' : 'failed'} for ${logOrderInfo}: ${response.status}`);
 
     return {
       success: response.ok,
@@ -139,7 +220,7 @@ export async function sendWebhookNotification(
     };
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    console.error(`Webhook notification failed to ${url} for order ${data.odrId || 'unknown'}:`, error);
+    console.error(`Webhook notification failed to ${url} for ${logOrderInfo}:`, error);
 
     // ENHANCED ERROR DETECTION: Better handling for Vercel deployment errors
     const errorCode = (error as Error & { code?: number })?.code;
@@ -167,7 +248,7 @@ export async function sendWebhookNotification(
                         !sourceLog.includes('cron-retry-no-retry'); // Prevent retry for cron jobs
     
     if (shouldRetry) {
-      console.log(`Retrying webhook notification for order ${data.odrId || 'unknown'} due to ${isTimeoutError ? 'timeout' : 'network'} error`);
+      console.log(`Retrying webhook notification for ${logOrderInfo} due to ${isTimeoutError ? 'timeout' : 'network'} error`);
       
       // Wait a short moment before retry
       await new Promise(resolve => setTimeout(resolve, 500));
@@ -182,28 +263,65 @@ export async function sendWebhookNotification(
       ? `Webhook timeout after ${process.env.VERCEL ? '6' : '12'}s (Vercel limit: 10s)` 
       : `Error sending webhook notification: ${errorMessage}`;
 
-    // Log the error with enhanced information
+    // IMPROVEMENT: Log errors separately for each order in batch
     if (writelog) {
-      await logWebhookTransaction({
-        success: false,
-        message: enhancedErrorMessage,
-        orderId: data.odrId as string || "",
-        orderReference: data.merchantOrdId as string || "",
-        status: data.odrStatus as string || "",
-        amount: typeof data.amount === 'number' ? data.amount : 0,
-        data: JSON.stringify({
-          requestUrl: url,
-          requestHeaders: headers,
-          requestBody: JSON.stringify(data),
-          error: errorMessage,
-          errorCategory,
-          isNetworkError,
-          isTimeoutError,
-          isVercelDeployment: !!process.env.VERCEL,
-          retryAttempted: shouldRetry
-        }),
-        source: sourceLog
-      });
+      // Helper: Get partial API key (first 3 + last 3 chars)
+      const getPartialApiKey = (key?: string): string => {
+        if (!key) return '';
+        if (key.length <= 6) return '***';
+        return `${key.substring(0, 3)}...${key.substring(key.length - 3)}`;
+      };
+
+      if (isArrayData) {
+        // For batch/array: Create one error log per order
+        const errorLogPromises = data.map((item, index) =>
+          logWebhookTransaction({
+            success: false,
+            message: enhancedErrorMessage,
+            orderId: item.odrId as string || "",
+            orderReference: item.merchantOrdId as string || "",
+            status: item.odrStatus as string || "",
+            amount: typeof item.amount === 'number' ? item.amount : 0,
+            data: JSON.stringify({
+              url: url,
+              method: "POST",
+              apiKey: getPartialApiKey(apikey),
+              error: errorMessage,
+              errorCategory,
+              isTimeoutError,
+              isNetworkError,
+              // Batch context
+              batchSize: itemCount,
+              batchIndex: index + 1
+            }),
+            source: `${sourceLog}-batch-error`
+          })
+        );
+        
+        await Promise.allSettled(errorLogPromises);
+      } else {
+        // For single order: Keep detailed error logging
+        await logWebhookTransaction({
+          success: false,
+          message: enhancedErrorMessage,
+          orderId: firstItem.odrId as string || "",
+          orderReference: firstItem.merchantOrdId as string || "",
+          status: firstItem.odrStatus as string || "",
+          amount: typeof firstItem.amount === 'number' ? firstItem.amount : 0,
+          data: JSON.stringify({
+            requestUrl: url,
+            requestHeaders: headers,
+            requestBody: JSON.stringify(data),
+            error: errorMessage,
+            errorCategory,
+            isNetworkError,
+            isTimeoutError,
+            isVercelDeployment: !!process.env.VERCEL,
+            retryAttempted: shouldRetry
+          }),
+          source: sourceLog
+        });
+      }
     }
 
     return {

@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from "next/server";
-import { sendWebhookNotification } from "@/utils/webhook";
 import { appwriteConfig } from "@/lib/appwrite/appwrite-config";
 import { getTransactionByOrderId, updateTransactionStatus } from "@/lib/actions/transaction.actions";
 
@@ -33,42 +32,49 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        // Send the webhook notification
-        const result = await sendWebhookNotification(callbackUrl, data, apiKey, true, 'manual-resend');
+        // Use centralized webhook notification system
+        const { sendWebhookNotifications } = await import('@/lib/webhook/send-notifications');
+        
+        // Create order data from provided data
+        const orderData = {
+            odrId: data.odrId,
+            merchantOrdId: data.merchantOrdId || '',
+            orderType: data.orderType as 'deposit' | 'withdraw',
+            odrStatus: data.odrStatus,
+            bankReceiveNumber: data.bankReceiveNumber || '',
+            bankReceiveOwnerName: data.bankReceiveOwnerName || '',
+            amount: data.amount || 0,
+            url_callback: callbackUrl,
+            apiKey: apiKey || '',
+            transactionId: transactionId, // For automatic notification status update
+        };
 
-        // If successful and we have a transaction ID, update the notification status
-        if (result.success && transactionId) {
-            try {
-                const { dbManager } = await import('@/lib/database/connection-manager');
-
-                // Use optimized database manager for non-blocking write operations
-                await dbManager.updateDocument(
-                    appwriteConfig.databaseId,
-                    appwriteConfig.odrtransCollectionId,
-                    transactionId,
-                    { isSentCallbackNotification: true },
-                    `update-notification-status:${data.odrId || transactionId}`
-                );
-
-                console.log(`Updated isSentCallbackNotification=true for transaction ${transactionId} (${data.odrId || 'unknown'})`);
-            } catch (updateError) {
-                console.error('Error updating notification status:', updateError);
-                // Continue with the response even if update fails
-            }
-        }
+        // Send webhook notification (handles batch/legacy mode based on order type)
+        const result = await sendWebhookNotifications(orderData, 'manual-resend');
 
         // Return the result
         if (result.success) {
             return NextResponse.json({
                 success: true,
                 message: "Webhook notification sent successfully",
-                details: result
+                details: {
+                    mode: result.mode,
+                    total: result.total,
+                    successful: result.successful,
+                    failed: result.failed
+                }
             });
         } else {
             return NextResponse.json({
                 success: false,
-                message: result.message,
-                details: result
+                message: result.errors[0]?.error || 'Failed to send webhook notification',
+                details: {
+                    mode: result.mode,
+                    total: result.total,
+                    successful: result.successful,
+                    failed: result.failed,
+                    errors: result.errors
+                }
             }, { status: 500 });
         }
     } catch (error) {
@@ -327,48 +333,25 @@ async function handleOrderBasedResend(orderId: string, updateStatusToFailed: boo
             );
         }
 
-        // Create webhook data
-        const webhookData = {
+        // Use centralized webhook notification system
+        const { sendWebhookNotifications } = await import('@/lib/webhook/send-notifications');
+        
+        // Create order data
+        const orderData = {
             odrId: updatedTransaction.odrId,
             merchantOrdId: updatedTransaction.merchantOrdId || '',
-            orderType: updatedTransaction.odrType,
+            orderType: updatedTransaction.odrType as 'deposit' | 'withdraw',
             odrStatus: updatedTransaction.odrStatus,
             bankReceiveNumber: updatedTransaction.bankReceiveNumber || '',
             bankReceiveOwnerName: updatedTransaction.bankReceiveOwnerName || '',
             amount: updatedTransaction.paidAmount || 0,
+            url_callback: updatedTransaction.urlCallBack,
+            apiKey: updatedTransaction.account?.apiKey || '',
+            transactionId: updatedTransaction.$id, // For automatic notification status update
         };
 
-        // Get merchant API key if available
-        const merchantApiKey = updatedTransaction.account?.apiKey || '';
-
-        // Send webhook notification
-        const result = await sendWebhookNotification(
-            updatedTransaction.urlCallBack,
-            webhookData,
-            merchantApiKey,
-            true,
-            'bulk-resend-notification'
-        );
-
-        // Update notification status if successful
-        if (result.success) {
-            try {
-                const { dbManager } = await import('@/lib/database/connection-manager');
-                
-                // Use optimized database manager for non-blocking write operations
-                await dbManager.updateDocument(
-                    appwriteConfig.databaseId,
-                    appwriteConfig.odrtransCollectionId,
-                    updatedTransaction.$id,
-                    { isSentCallbackNotification: true },
-                    `update-notification-status:${orderId}`
-                );
-                console.log(`Updated isSentCallbackNotification=true for transaction ${orderId}`);
-            } catch (updateError) {
-                console.error('Error updating notification status:', updateError);
-                // Continue with success response even if update fails
-            }
-        }
+        // Send webhook notification (handles batch/legacy mode based on order type)
+        const webhookResult = await sendWebhookNotifications(orderData, 'manual-resend');
 
         const responseMessage = shouldUpdateToFailed 
             ? `Transaction status updated to failed and notification sent successfully for order ${orderId}`
@@ -377,12 +360,18 @@ async function handleOrderBasedResend(orderId: string, updateStatusToFailed: boo
             : `Notification sent successfully for order ${orderId}`;
 
         return NextResponse.json({
-            success: result.success,
-            message: result.success ? responseMessage : result.message,
+            success: webhookResult.success,
+            message: webhookResult.success ? responseMessage : `Failed to send notification: ${webhookResult.errors[0]?.error || 'Unknown error'}`,
             statusUpdated: shouldUpdateToFailed || shouldMarkCompleted,
             markedAsCompleted: shouldMarkCompleted,
             finalStatus: finalStatuses.includes(transaction.odrStatus),
-            details: result
+            details: {
+                success: webhookResult.success,
+                mode: webhookResult.mode,
+                total: webhookResult.total,
+                successful: webhookResult.successful,
+                failed: webhookResult.failed
+            }
         });
 
     } catch (error) {

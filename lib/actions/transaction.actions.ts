@@ -605,11 +605,22 @@ export async function updateTransactionStatus(
     const readClient = await DatabaseOptimizer.getReadOnlyClient();
 
     // Get the current transaction using read-only client
-    const transaction = await readClient.database.getDocument(
-      DATABASE_ID,
-      ODRTRANS_COLLECTION_ID,
-      transactionId
-    ) as Transaction;
+    let transaction: Transaction;
+    try {
+      transaction = await readClient.database.getDocument(
+        DATABASE_ID,
+        ODRTRANS_COLLECTION_ID,
+        transactionId
+      ) as Transaction;
+    } catch (fetchError) {
+      console.error(`Error fetching transaction ${transactionId}:`, fetchError);
+      // If fetch fails but we can still attempt the update, continue with minimal data
+      // Otherwise re-throw
+      if (fetchError instanceof Error && fetchError.message.includes('documentId')) {
+        throw new Error(`Invalid transaction ID format: ${transactionId.substring(0, 50)}...`);
+      }
+      throw fetchError;
+    }
 
     // If transaction is already in the target status, return early
     if (transaction.odrStatus === newStatus) {

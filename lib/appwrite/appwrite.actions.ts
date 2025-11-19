@@ -272,6 +272,603 @@ export async function appwriteBackupCollection(collectionId: string): Promise<ap
       console.error(`Failed to backup collection ${collectionId}:`, error);  
       throw new Error(`Failed to backup collection ${collectionId}`);  
   }  
+}
+
+// Archive data types
+export interface ArchiveOptions {
+  cutoffDate: Date; // Archive documents created before this date
+  dryRun: boolean; // If true, only simulate without deleting
+  includeRelationships: boolean; // If true, include related documents
+  countOnly?: boolean; // If true, only count documents without fetching full data (faster preview)
+  selectedCollections?: string[]; // If provided, only archive these collection IDs
+}
+
+export interface ArchiveResult {
+  success: boolean;
+  message: string;
+  dryRun: boolean;
+  cutoffDate: string;
+  stats: {
+    collections: number;
+    documentsToArchive: number;
+    documentsArchived?: number;
+    documentsDeleted?: number;
+    relationshipsTracked: number;
+  };
+  archiveData?: appwriteDatabaseBackup;
+  errors?: string[];
+  preview?: {
+    collectionId: string;
+    collectionName: string;
+    documentCount: number;
+    sampleDocuments: appwriteDocument[];
+  }[];
+}
+
+// Get list of all collections
+export async function getDatabaseCollections(): Promise<{ id: string; name: string }[]> {
+  try {
+    const admin = await createAdminClient();
+    const databases = admin.database;
+    const databaseId = process.env.NEXT_PUBLIC_APPWRITE_DATABASE_ID!;
+    
+    const collections = await databases.listCollections(databaseId);
+    
+    return collections.collections.map(col => ({
+      id: col.$id,
+      name: col.name
+    }));
+  } catch (error) {
+    console.error('Failed to get collections:', error);
+    throw new Error(`Failed to get collections: ${(error as Error).message}`);
+  }
+}
+
+// Get relationship attributes for a collection
+async function getCollectionRelationships(
+  databases: Databases,
+  databaseId: string,
+  collectionId: string
+): Promise<{ attribute: string; relatedCollection: string; twoWay: boolean }[]> {
+  try {
+    const collection = await databases.getCollection(databaseId, collectionId);
+    const relationships: { attribute: string; relatedCollection: string; twoWay: boolean }[] = [];
+    
+    for (const attr of collection.attributes) {
+      if (attr.type === 'relationship') {
+        const relAttr = attr as any;
+        relationships.push({
+          attribute: attr.key,
+          relatedCollection: relAttr.relatedCollection || '',
+          twoWay: relAttr.twoWay || false
+        });
+      }
+    }
+    
+    return relationships;
+  } catch (error) {
+    console.error(`Failed to get relationships for collection ${collectionId}:`, error);
+    return [];
+  }
+}
+
+// Archive old database records
+export async function archiveDatabaseData(
+  options: ArchiveOptions
+): Promise<ArchiveResult> {
+  try {
+    const admin = await createAdminClient();
+    const databases = admin.database;
+    const databaseId = process.env.NEXT_PUBLIC_APPWRITE_DATABASE_ID!;
+    
+    const { cutoffDate, dryRun, includeRelationships, countOnly = false, selectedCollections } = options;
+    
+    // Validate cutoff date (must not be future)
+    const now = new Date();
+    
+    if (cutoffDate > now) {
+      throw new Error('Cutoff date cannot be in the future');
+    }
+    
+    const errors: string[] = [];
+    const stats = {
+      collections: 0,
+      documentsToArchive: 0,
+      documentsArchived: 0,
+      documentsDeleted: 0,
+      relationshipsTracked: 0
+    };
+    
+    const archiveData: appwriteDatabaseBackup = {
+      timestamp: new Date().toISOString(),
+      collections: {},
+      users: []
+    };
+    
+    const preview: {
+      collectionId: string;
+      collectionName: string;
+      documentCount: number;
+      sampleDocuments: appwriteDocument[];
+    }[] = [];
+    
+    // Get all collections
+    const allCollections = await databases.listCollections(databaseId);
+    
+    // Filter collections if selectedCollections is provided
+    const collections = selectedCollections && selectedCollections.length > 0
+      ? allCollections.collections.filter(col => selectedCollections.includes(col.$id))
+      : allCollections.collections;
+    
+    console.log(`Found ${collections.length} collections to check ${selectedCollections ? '(filtered)' : '(all)'}`);
+    
+    // Track document IDs that need to be archived due to relationships
+    const relatedDocumentIds = new Map<string, Set<string>>(); // collectionId -> Set of document IDs
+    
+    // First pass: Identify documents to archive based on date
+    for (const collection of collections) {
+      try {
+        const collectionId = collection.$id;
+        const collectionName = collection.name;
+        
+        console.log(`Checking collection: ${collectionName} (${collectionId})`);
+        
+        // Count-only mode: Just count documents without fetching full data
+        if (countOnly) {
+          try {
+            // Appwrite's total field is capped at 5000, so we need to use offset to count accurately
+            let totalCount = 0;
+            let offset = 0;
+            const limit = 1; // Minimal fetch for counting
+            let hasMore = true;
+            
+            while (hasMore) {
+              const countResult = await databases.listDocuments(
+                databaseId,
+                collectionId,
+                [
+                  Query.lessThan('$createdAt', cutoffDate.toISOString()),
+                  Query.limit(limit),
+                  Query.offset(offset)
+                ]
+              );
+              
+              // If we got documents, count them
+              const batchTotal = countResult.total;
+              
+              if (batchTotal === 0 || countResult.documents.length === 0) {
+                // No more documents
+                hasMore = false;
+              } else if (batchTotal < 5000) {
+                // Total is accurate (less than Appwrite's 5000 cap)
+                totalCount = batchTotal;
+                hasMore = false;
+              } else {
+                // Total is capped at 5000, need to continue counting with offset
+                // We know there are at least 5000 documents
+                offset += 5000;
+                
+                // Check if there are more beyond this offset
+                const checkResult = await databases.listDocuments(
+                  databaseId,
+                  collectionId,
+                  [
+                    Query.lessThan('$createdAt', cutoffDate.toISOString()),
+                    Query.limit(1),
+                    Query.offset(offset)
+                  ]
+                );
+                
+                if (checkResult.documents.length === 0) {
+                  // No more documents beyond this offset
+                  totalCount = offset;
+                  hasMore = false;
+                } else {
+                  // There are more documents, continue
+                  totalCount = offset + checkResult.total;
+                  
+                  if (checkResult.total < 5000) {
+                    // We've reached the end
+                    hasMore = false;
+                  }
+                }
+                
+                // Log progress for large collections
+                if (offset > 0) {
+                  console.log(`  Counting... found at least ${totalCount} documents so far`);
+                }
+              }
+              
+              // Small delay to avoid timeout
+              await new Promise(resolve => setTimeout(resolve, 100));
+            }
+            
+            if (totalCount > 0) {
+              console.log(`  Found ${totalCount} documents to archive`);
+              stats.collections++;
+              stats.documentsToArchive += totalCount;
+              
+              preview.push({
+                collectionId,
+                collectionName,
+                documentCount: totalCount,
+                sampleDocuments: []
+              });
+            }
+          } catch (countError) {
+            const err = `Failed to count documents in ${collectionName}: ${(countError as Error).message}`;
+            console.error(err);
+            errors.push(err);
+          }
+          continue; // Skip to next collection in count-only mode
+        }
+        
+        // Full mode: Get collection schema and relationships
+        const collectionDetails = await databases.getCollection(databaseId, collectionId);
+        const relationships = includeRelationships 
+          ? await getCollectionRelationships(databases, databaseId, collectionId)
+          : [];
+        
+        if (relationships.length > 0) {
+          console.log(`  Found ${relationships.length} relationships:`, relationships.map(r => `${r.attribute} -> ${r.relatedCollection}`));
+          stats.relationshipsTracked += relationships.length;
+        }
+        
+        // For actual deletion (not dry run), just check if any documents exist
+        // We'll query and delete in batches later - no need to count total
+        if (!dryRun) {
+          // Quick check if any documents exist
+          const checkResult = await databases.listDocuments(
+            databaseId,
+            collectionId,
+            [
+              Query.lessThan('$createdAt', cutoffDate.toISOString()),
+              Query.limit(1) // Just check existence
+            ]
+          );
+          
+          if (checkResult.documents.length > 0) {
+            console.log(`  Found old documents to delete (will delete in batches)`);
+            stats.collections++;
+            
+            // Store minimal info for deletion phase
+            archiveData.collections[collectionId] = {
+              name: collectionName,
+              enabled: collectionDetails.enabled,
+              documentSecurity: collectionDetails.documentSecurity,
+              attributes: collectionDetails.attributes as unknown as appwriteCollectionAttribute[],
+              documents: [] // Empty - we'll delete directly without storing
+            };
+          }
+          
+          continue; // Skip to next collection - no need to fetch documents
+        }
+        
+        // Dry run mode: Fetch documents for preview
+        let documentsOffset = 0;
+        const documentsLimit = 25;
+        let hasMoreDocuments = true;
+        const oldDocuments: appwriteDocument[] = [];
+        let batchCount = 0;
+        
+        while (hasMoreDocuments) {
+          try {
+            const documents = await databases.listDocuments(
+              databaseId,
+              collectionId,
+              [
+                Query.lessThan('$createdAt', cutoffDate.toISOString()),
+                Query.limit(documentsLimit),
+                Query.offset(documentsOffset)
+              ]
+            );
+            
+            oldDocuments.push(...documents.documents as appwriteDocument[]);
+            batchCount++;
+            
+            if (documents.documents.length < documentsLimit) {
+              hasMoreDocuments = false;
+            } else {
+              documentsOffset += documentsLimit;
+              
+              // Add delay every 5 batches to avoid overwhelming the server
+              if (batchCount % 5 === 0) {
+                console.log(`  Fetched ${oldDocuments.length} documents so far...`);
+                await new Promise(resolve => setTimeout(resolve, 500));
+              }
+            }
+          } catch (batchError) {
+            const err = `Failed to fetch batch at offset ${documentsOffset} from ${collectionName}: ${(batchError as Error).message}`;
+            console.error(err);
+            errors.push(err);
+            hasMoreDocuments = false; // Stop on error
+          }
+        }
+        
+        if (oldDocuments.length > 0) {
+          console.log(`  Found ${oldDocuments.length} documents to archive`);
+          stats.collections++;
+          stats.documentsToArchive += oldDocuments.length;
+          
+          // Track related documents if includeRelationships is true
+          if (includeRelationships && relationships.length > 0) {
+            for (const doc of oldDocuments) {
+              for (const rel of relationships) {
+                const relatedValue = doc[rel.attribute];
+                if (relatedValue) {
+                  // Handle both single ID and array of IDs
+                  const relatedIds = Array.isArray(relatedValue) ? relatedValue : [relatedValue];
+                  
+                  for (const relatedId of relatedIds) {
+                    if (typeof relatedId === 'string') {
+                      if (!relatedDocumentIds.has(rel.relatedCollection)) {
+                        relatedDocumentIds.set(rel.relatedCollection, new Set());
+                      }
+                      relatedDocumentIds.get(rel.relatedCollection)!.add(relatedId);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          
+          // Store in archive data
+          archiveData.collections[collectionId] = {
+            name: collectionName,
+            enabled: collectionDetails.enabled,
+            documentSecurity: collectionDetails.documentSecurity,
+            attributes: collectionDetails.attributes as unknown as appwriteCollectionAttribute[],
+            documents: oldDocuments
+          };
+          
+          // Add to preview (first 3 documents to reduce payload)
+          preview.push({
+            collectionId,
+            collectionName,
+            documentCount: oldDocuments.length,
+            sampleDocuments: oldDocuments.slice(0, 3)
+          });
+        }
+        
+        // Small delay between collections
+        await new Promise(resolve => setTimeout(resolve, 200));
+      } catch (error) {
+        const err = `Failed to process collection ${collection.name}: ${(error as Error).message}`;
+        console.error(err);
+        errors.push(err);
+      }
+    }
+    
+    // Second pass: Include related documents if needed (skip in count-only mode)
+    // IMPORTANT: Only include related documents that are ALSO old (before cutoff date)
+    // to avoid breaking references from newer documents
+    if (!countOnly && includeRelationships && relatedDocumentIds.size > 0) {
+      console.log(`\nChecking related documents from ${relatedDocumentIds.size} collections...`);
+      
+      for (const [collectionId, documentIds] of relatedDocumentIds.entries()) {
+        try {
+          // Skip if already processed
+          if (archiveData.collections[collectionId]) {
+            console.log(`  Collection ${collectionId} already archived, skipping related documents`);
+            continue;
+          }
+          
+          const collectionDetails = await databases.getCollection(databaseId, collectionId);
+          const relatedDocs: appwriteDocument[] = [];
+          
+          // Fetch related documents in smaller batches
+          const docIdsArray = Array.from(documentIds);
+          const batchSize = 10;
+          
+          for (let i = 0; i < docIdsArray.length; i += batchSize) {
+            const batch = docIdsArray.slice(i, i + batchSize);
+            
+            for (const docId of batch) {
+              try {
+                const doc = await databases.getDocument(databaseId, collectionId, docId);
+                
+                // SAFETY CHECK: Only include if the related document is also old
+                // This prevents breaking references from newer documents
+                const docCreatedAt = new Date(doc.$createdAt);
+                if (docCreatedAt < cutoffDate) {
+                  relatedDocs.push(doc as appwriteDocument);
+                  console.log(`  Including related document ${docId} (created: ${doc.$createdAt})`);
+                } else {
+                  console.log(`  Skipping related document ${docId} (too new: ${doc.$createdAt})`);
+                }
+              } catch (error) {
+                console.warn(`  Could not fetch related document ${docId} from ${collectionId}:`, (error as Error).message);
+              }
+            }
+            
+            // Delay between batches
+            if (i + batchSize < docIdsArray.length) {
+              await new Promise(resolve => setTimeout(resolve, 300));
+            }
+          }
+          
+          if (relatedDocs.length > 0) {
+            console.log(`  Found ${relatedDocs.length} related documents (also old) in ${collectionDetails.name}`);
+            stats.documentsToArchive += relatedDocs.length;
+            
+            archiveData.collections[collectionId] = {
+              name: collectionDetails.name,
+              enabled: collectionDetails.enabled,
+              documentSecurity: collectionDetails.documentSecurity,
+              attributes: collectionDetails.attributes as unknown as appwriteCollectionAttribute[],
+              documents: relatedDocs
+            };
+          } else {
+            console.log(`  No old related documents found in ${collectionDetails.name} (all are still in use)`);
+          }
+        } catch (error) {
+          const err = `Failed to include related documents from ${collectionId}: ${(error as Error).message}`;
+          console.error(err);
+          errors.push(err);
+        }
+      }
+    }
+    
+    // Dry run: Return preview without deleting
+    if (dryRun) {
+      const mode = countOnly ? ' (count only)' : '';
+      return {
+        success: true,
+        message: `DRY RUN${mode}: Would archive ${stats.documentsToArchive} documents from ${stats.collections} collections`,
+        dryRun: true,
+        cutoffDate: cutoffDate.toISOString(),
+        stats,
+        archiveData: countOnly ? { timestamp: archiveData.timestamp, collections: {}, users: [] } : archiveData,
+        preview,
+        errors: errors.length > 0 ? errors : undefined
+      };
+    }
+    
+    // SAFETY CHECK: Cannot delete in count-only mode (no actual documents fetched)
+    if (countOnly) {
+      throw new Error(
+        'Cannot perform actual deletion in count-only mode. ' +
+        'Please uncheck "Quick Count" to fetch full document data before deleting.'
+      );
+    }
+    
+    // Actual archiving: Delete documents from database in batches
+    // Query and delete in larger batches with parallel deletion for speed
+    console.log(`\nDeleting archived documents in optimized batches...`);
+    
+    for (const [collectionId, collectionData] of Object.entries(archiveData.collections)) {
+      console.log(`Deleting from ${collectionData.name}...`);
+      
+      let deletedInCollection = 0;
+      const batchSize = 500; // Larger batches for speed
+      const parallelDeletes = 50; // High parallelism for fast deletion
+      
+      // Continuously query and delete until no more old documents exist
+      let hasMoreToDelete = true;
+      let consecutiveErrors = 0;
+      const maxConsecutiveErrors = 5; // More tolerance for timeouts
+      let stuckCount = 0; // Track if we're stuck on same documents
+      const maxStuckAttempts = 3; // Skip to next batch after 3 failed attempts
+      
+      while (hasMoreToDelete) {
+        try {
+          // Query for a batch of old documents (always from offset 0 since we're deleting)
+          const batch = await databases.listDocuments(
+            databaseId,
+            collectionId,
+            [
+              Query.lessThan('$createdAt', cutoffDate.toISOString()),
+              Query.limit(batchSize)
+            ]
+          );
+          
+          if (batch.documents.length === 0) {
+            // No more documents to delete
+            hasMoreToDelete = false;
+            break;
+          }
+          
+          // Reset error counter on successful query
+          consecutiveErrors = 0;
+          
+          // Track successful deletions in this batch
+          let successfulDeletes = 0;
+          
+          // Delete documents in parallel chunks for speed
+          for (let i = 0; i < batch.documents.length; i += parallelDeletes) {
+            const chunk = batch.documents.slice(i, i + parallelDeletes);
+            
+            console.log(`  🔄 Deleting chunk ${Math.floor(i/parallelDeletes) + 1}/${Math.ceil(batch.documents.length/parallelDeletes)} (${chunk.length} docs)...`);
+            
+            // Delete all documents in this chunk in parallel
+            const deletePromises = chunk.map(doc => 
+              databases.deleteDocument(databaseId, collectionId, doc.$id)
+                .then(() => {
+                  stats.documentsDeleted++;
+                  deletedInCollection++;
+                  successfulDeletes++;
+                  return { success: true, id: doc.$id };
+                })
+                .catch((error) => {
+                  // Don't log full HTML error pages, just the error type
+                  const errorMsg = (error as Error).message;
+                  const shortError = errorMsg.includes('<!DOCTYPE') 
+                    ? 'Connection timeout (522)' 
+                    : errorMsg.substring(0, 100);
+                  console.warn(`  ⚠ Skip document ${doc.$id}: ${shortError}`);
+                  // Don't add to errors array to avoid flooding logs
+                  return { success: false, id: doc.$id, error: shortError };
+                })
+            );
+            
+            await Promise.all(deletePromises);
+            
+            // No delay - go as fast as possible
+            
+            // Log progress every 5000 documents
+            if (stats.documentsDeleted % 5000 === 0) {
+              console.log(`  ${stats.documentsDeleted} documents deleted so far...`);
+            }
+          }
+          
+          // Check if we're stuck (no successful deletions)
+          if (successfulDeletes === 0) {
+            stuckCount++;
+            console.warn(`  ⚠ Stuck attempt ${stuckCount}/${maxStuckAttempts} - no documents deleted in this batch`);
+            
+            if (stuckCount >= maxStuckAttempts) {
+              console.log(`  ⏭ Too many stuck attempts, assuming remaining documents are inaccessible. Moving on.`);
+              hasMoreToDelete = false;
+              break;
+            }
+            
+            // Wait before retrying stuck batch
+            console.log(`  ⏳ Waiting 1 second before retry...`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          } else {
+            // Reset stuck counter if we made progress
+            stuckCount = 0;
+            console.log(`  ✓ Batch complete: ${successfulDeletes} deleted successfully`);
+            
+            // Minimal delay between batches
+            await new Promise(resolve => setTimeout(resolve, 50));
+          }
+          
+        } catch (batchError) {
+          consecutiveErrors++;
+          const err = `Failed to query batch for deletion from ${collectionData.name}: ${(batchError as Error).message}`;
+          console.error(err);
+          errors.push(err);
+          
+          if (consecutiveErrors >= maxConsecutiveErrors) {
+            console.error(`Too many consecutive errors (${consecutiveErrors}), stopping deletion for ${collectionData.name}`);
+            hasMoreToDelete = false;
+          } else {
+            // Add delay only on error (possible rate limit)
+            console.log(`  Waiting 2 seconds before retry (error ${consecutiveErrors}/${maxConsecutiveErrors})...`);
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          }
+        }
+      }
+      
+      console.log(`  Completed: ${deletedInCollection} documents deleted from ${collectionData.name}`);
+    }
+    
+    stats.documentsArchived = stats.documentsDeleted;
+    
+    return {
+      success: errors.length === 0,
+      message: `Archived ${stats.documentsArchived} documents from ${stats.collections} collections`,
+      dryRun: false,
+      cutoffDate: cutoffDate.toISOString(),
+      stats,
+      archiveData,
+      errors: errors.length > 0 ? errors : undefined
+    };
+  } catch (error) {
+    console.error('Archive failed:', error);
+    throw new Error(`Failed to archive data: ${(error as Error).message}`);
+  }
 }  
 
 // Helper function to infer attribute type from value

@@ -8,7 +8,6 @@
 import { NextResponse } from 'next/server';
 import { log } from '@/lib/logger';
 import { TransactionStatus } from '@/lib/actions/bankTransacionEntry.action';
-import { sendWebhookNotification } from '@/utils/webhook';
 
 /**
  * Interface for transaction results from processing
@@ -28,6 +27,7 @@ export interface WebhookResult {
   bankReceiveOwnerName?: string;
   paidAmount?: number;
   apiKey?: string; // Merchant API key for webhook authentication
+  transactionId?: string; // Bank transaction entry ID for notification status updates
   metrics?: TransactionProcessingMetrics;
 }
 
@@ -71,9 +71,8 @@ interface WebhookResponseConfig {
 
 /**
  * OPTIMIZATION: Send merchant webhook notifications
- * Two modes based on config:
- * 1. BATCHING MODE (default): Groups orders by callback URL, sends as array in single request
- * 2. PARALLEL MODE (legacy): Sends each order in separate parallel requests
+ * Uses centralized sendWebhookNotifications function with support for
+ * separate batch/legacy modes per order type (deposit/withdraw)
  */
 async function sendMerchantWebhooks(results: WebhookResult[]): Promise<void> {
   // Filter successful transactions with callback URLs
@@ -88,98 +87,30 @@ async function sendMerchantWebhooks(results: WebhookResult[]): Promise<void> {
     return; // No webhooks to send
   }
 
-  // Get batching config
-  const { isWebhookCallbackBatchingEnabled } = await import('@/lib/appconfig');
-  const batchingEnabled = isWebhookCallbackBatchingEnabled();
+  // Import centralized webhook notification function
+  const { sendWebhookNotifications } = await import('@/lib/webhook/send-notifications');
+  
+  // Convert WebhookResult[] to WebhookOrderData[]
+  const orders = callbackResults.map(result => ({
+    odrId: result.odrId!,
+    merchantOrdId: result.merchantOrdId || '',
+    orderType: result.orderType! as 'deposit' | 'withdraw',
+    odrStatus: result.odrStatus!,
+    bankReceiveNumber: result.bankReceiveNumber || '',
+    bankReceiveOwnerName: result.bankReceiveOwnerName || '',
+    amount: result.paidAmount || 0,
+    url_callback: result.url_callback!,
+    apiKey: result.apiKey,
+    transactionId: result.transactionId, // Bank transaction entry ID for notification status updates
+  }));
 
-  // BATCHING MODE: Group by callback URL and send as arrays (regardless of incoming mode)
-  if (batchingEnabled) {
-    console.log(`🔄 [Batching Mode] Grouping ${callbackResults.length} orders by callback URL`);
-    
-    // Group by url_callback (multiple orders can have same callback URL)
-    const groupedByCallback = new Map<string, WebhookResult[]>();
-    
-    for (const result of callbackResults) {
-      const callbackUrl = result.url_callback!;
-      if (!groupedByCallback.has(callbackUrl)) {
-        groupedByCallback.set(callbackUrl, []);
-      }
-      groupedByCallback.get(callbackUrl)!.push(result);
-    }
-
-    console.log(`📊 [Batching Mode] Found ${groupedByCallback.size} unique callback URLs`);
-
-    // Send one webhook per unique callback URL
-    const webhookPromises = Array.from(groupedByCallback.entries()).map(
-      async ([url, orders]) => {
-        try {
-          // Get API key from first order (all orders with same URL should have same merchant/key)
-          const apiKey = orders[0].apiKey;
-          
-          // BATCHING MODE: ALWAYS send as array (even for single items)
-          // This ensures consistent format for merchants - they always expect array[]
-          const webhookData = orders.map(order => ({
-            odrId: order.odrId!,
-            merchantOrdId: order.merchantOrdId || '',
-            orderType: order.orderType!,
-            odrStatus: order.odrStatus!,
-            bankReceiveNumber: order.bankReceiveNumber || '',
-            bankReceiveOwnerName: order.bankReceiveOwnerName || '',
-            amount: order.paidAmount || 0,
-          }));
-          
-          await sendWebhookNotification(
-            url,
-            webhookData as unknown as Record<string, unknown>, // Always array format
-            apiKey,
-            true,
-            orders.length === 1 ? 'webhook-payment-batch-single' : 'webhook-payment-batch-bulk'
-          );
-          
-          console.log(`📦 [Batching Mode] Sent webhook to ${url} with array[${orders.length}] (${orders.length === 1 ? 'single item' : 'bulk items'})`)
-        } catch (error) {
-          console.error(`❌ Failed to send webhook to ${url}:`, error);
-          // Don't throw - webhook failures shouldn't block response
-        }
-      }
-    );
-
-    // Wait for all webhooks to complete (in parallel)
-    await Promise.allSettled(webhookPromises);
-    
-  } else {
-    // PARALLEL MODE: Send each order separately (legacy behavior)
-    console.log(`🔀 [Parallel Mode] Sending ${callbackResults.length} webhooks separately`);
-    
-    const webhookPromises = callbackResults.map(async (result) => {
-      try {
-        const webhookData = {
-          odrId: result.odrId!,
-          merchantOrdId: result.merchantOrdId || '',
-          orderType: result.orderType!,
-          odrStatus: result.odrStatus!,
-          bankReceiveNumber: result.bankReceiveNumber || '',
-          bankReceiveOwnerName: result.bankReceiveOwnerName || '',
-          amount: result.paidAmount || 0,
-        };
-        
-        await sendWebhookNotification(
-          result.url_callback!,
-          webhookData,
-          result.apiKey,
-          true,
-          'webhook-payment-single'
-        );
-        
-        console.log(`📤 [Parallel Mode] Sent webhook for order ${result.odrId} to ${result.url_callback}`);
-      } catch (error) {
-        console.error(`❌ Failed to send webhook for order ${result.odrId}:`, error);
-        // Don't throw - webhook failures shouldn't block response
-      }
-    });
-
-    // Wait for all webhooks to complete (in parallel)
-    await Promise.allSettled(webhookPromises);
+  // Send webhooks using centralized function (handles batch/legacy per order type)
+  const webhookResults = await sendWebhookNotifications(orders, 'webhook-payment');
+  
+  // Log results
+  console.log(`📨 Webhook notifications sent: ${webhookResults.successful}/${webhookResults.total} successful (${webhookResults.mode} mode)`);
+  if (webhookResults.failed > 0) {
+    console.error(`❌ ${webhookResults.failed} webhook notifications failed`);
   }
 }
 

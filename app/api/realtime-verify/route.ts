@@ -9,8 +9,8 @@ import { loadAppConfigAsync } from '@/lib/json/config-loader';
 
 export async function GET() {
   try {
-    // Force fresh config from blob storage (no cache)
-    const appConfig = await loadAppConfigAsync(true);
+    // Use cached config (24-hour cache, near-zero Redis cost)
+    const appConfig = await loadAppConfigAsync();
     const runningMode = appConfig.databaseSettings?.coreRunningMode || 'auto';
     
     // Only return credentials based on active mode

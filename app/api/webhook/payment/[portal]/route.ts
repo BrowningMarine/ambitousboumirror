@@ -265,7 +265,14 @@ export async function fastTrackTransaction(portal: string, transactionId: string
 // OPTIMIZATION: Adaptive concurrency based on portal performance and system load
 function getOptimalConcurrency(portal: string, transactionCount: number): number {
   const metrics = portalMetrics.get(portal);
-  let baseConcurrency = 12; // Default
+  
+  // IMPROVEMENT: Allow environment variable override for self-hosted Appwrite
+  // Set MAX_WEBHOOK_CONCURRENCY=5 for resource-limited servers
+  const maxConcurrencyOverride = process.env.MAX_WEBHOOK_CONCURRENCY 
+    ? parseInt(process.env.MAX_WEBHOOK_CONCURRENCY) 
+    : null;
+  
+  let baseConcurrency = maxConcurrencyOverride || 12; // Default 12, or env override
   
   // Adjust based on batch size - larger batches need more careful concurrency
   if (transactionCount > 100) {
@@ -1705,6 +1712,7 @@ async function processUniversalTransaction(
     let bankReceiveOwnerName: string | undefined;
     let paidAmount: number | undefined;
     let apiKey: string | undefined;
+    let orderDocumentId: string | undefined; // The actual order document ID for notification status updates
 
     // Fetch order details based on running mode (for webhook callbacks)
     if (odrId) {
@@ -1716,6 +1724,7 @@ async function processUniversalTransaction(
             const transaction = await getTransactionByOrderId(odrId);
             
             if (transaction) {
+              orderDocumentId = transaction.$id; // ✅ Capture the order document ID
               urlCallback = transaction.urlCallBack || undefined;
               merchantOrdId = transaction.merchantOrdId || undefined;
               orderType = transaction.odrType;
@@ -1747,6 +1756,8 @@ async function processUniversalTransaction(
               const order = await backupOrderService.getBackupOrder(odrId);
               
               if (order) {
+                // Use Supabase ID if it has synced appwrite_doc_id, otherwise use its own id
+                orderDocumentId = order.appwrite_doc_id || order.id;
                 urlCallback = order.url_callback || undefined;
                 merchantOrdId = order.merchant_odr_id || undefined;
                 orderType = order.odr_type;
@@ -1787,6 +1798,8 @@ async function processUniversalTransaction(
           const order = await backupOrderService.getBackupOrder(odrId);
           
           if (order) {
+            // Use Supabase ID if it has synced appwrite_doc_id, otherwise use its own id
+            orderDocumentId = order.appwrite_doc_id || order.id;
             urlCallback = order.url_callback || undefined;
             merchantOrdId = order.merchant_odr_id || undefined;
             orderType = order.odr_type;
@@ -1835,6 +1848,7 @@ async function processUniversalTransaction(
       bankReceiveOwnerName,
       paidAmount,
       apiKey, // For bulk webhook authentication
+      transactionId: orderDocumentId, // ✅ FIXED: Use order document ID (not bank entry ID) for notification status updates
       message: `Transaction ${finalStatus === 'processed' ? 'processed successfully' : 
                 finalStatus === 'available' ? 'recorded as available for redemption' : 'failed'}`,
       metrics: processingMetrics

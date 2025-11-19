@@ -426,14 +426,35 @@ export async function POST(request: Request) {
     const { 
       paymentId, 
       orderId,
-      expectedAmount,
-      transactionType: orderType = 'withdraw', // Default to withdraw for backward compatibility
+      expectedAmount: providedExpectedAmount,
+      transactionType: providedOrderType,
       portal = 'cassoflow' // Default to cassoflow
     } = body;
 
+    // If expectedAmount or transactionType not provided, fetch transaction from database
+    let expectedAmount = providedExpectedAmount;
+    let orderType = providedOrderType || 'withdraw'; // Default to withdraw for backward compatibility
+    
+    // Fetch transaction details if not provided
+    if ((!expectedAmount || !providedOrderType) && orderId) {
+      const { getTransactionByOrderId } = await import('@/lib/actions/transaction.actions');
+      const transaction = await getTransactionByOrderId(orderId);
+      
+      if (!transaction) {
+        return NextResponse.json(
+          { success: false, message: `Transaction with order ID ${orderId} not found in database` },
+          { status: 404 }
+        );
+      }
+      
+      // Use transaction details from database
+      expectedAmount = transaction.unPaidAmount || transaction.amount;
+      orderType = transaction.odrType;
+    }
+
     if ((!paymentId && !orderId) || !expectedAmount) {
       return NextResponse.json(
-        { success: false, message: 'Either Payment ID or Order ID, and expected amount are required' },
+        { success: false, message: 'Either Payment ID or Order ID is required, and transaction must exist in database' },
         { status: 400 }
       );
     }

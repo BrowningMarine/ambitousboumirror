@@ -226,6 +226,12 @@ export class MerchantAccountCacheService {
    */
   async getMerchantByApiKey(apiKey: string, merchantId: string): Promise<MerchantAccountCache | null> {
     try {
+      console.log('🔍 [Supabase Query] Looking for merchant:', {
+        merchantId,
+        apiKeyPrefix: apiKey.substring(0, 8) + '...',
+        apiKeyLength: apiKey.length
+      });
+      
       // First try exact match (for backward compatibility with plain keys)
       let { data, error } = await this.supabase
         .from('merchant_accounts_cache')
@@ -235,10 +241,22 @@ export class MerchantAccountCacheService {
         .eq('status', true)
         .single();
 
+      if (data) {
+        console.log('✅ [Supabase Query] Found merchant with exact API key match');
+        return data as MerchantAccountCache;
+      }
+      
+      console.log('⚠️ [Supabase Query] Exact match failed, trying hash comparison');
+
       // If not found, try hash comparison
       if (error || !data) {
         const crypto = await import('crypto');
         const apiKeyHash = crypto.createHash('sha256').update(apiKey).digest('hex');
+        console.log('🔍 [Supabase Query] Trying with hashed API key:', {
+          hashPrefix: apiKeyHash.substring(0, 16) + '...',
+          hashLength: apiKeyHash.length
+        });
+        
         const hashResult = await this.supabase
           .from('merchant_accounts_cache')
           .select('*')
@@ -249,14 +267,35 @@ export class MerchantAccountCacheService {
         
         data = hashResult.data;
         error = hashResult.error;
+        
+        if (data) {
+          console.log('✅ [Supabase Query] Found merchant with hashed API key match');
+          return data as MerchantAccountCache;
+        }
       }
 
-      if (error || !data) {
-        console.log('❌ Merchant not found in cache');
-        return null;
-      }
+      // Try without status filter as last resort
+      console.log('⚠️ [Supabase Query] Hash match failed, trying without status filter');
+      const noStatusResult = await this.supabase
+        .from('merchant_accounts_cache')
+        .select('*')
+        .eq('api_key', apiKey)
+        .eq('merchant_id', merchantId)
+        .single();
       
-      return data as MerchantAccountCache;
+      if (noStatusResult.data) {
+        console.log('⚠️ [Supabase Query] Found merchant but status is not true:', noStatusResult.data.status);
+        return noStatusResult.data as MerchantAccountCache;
+      }
+
+      console.log('❌ [Supabase Query] Merchant not found in cache after all attempts');
+      console.log('💡 [Supabase Query] Debug: Check if merchant exists with query:', {
+        table: 'merchant_accounts_cache',
+        filters: { merchant_id: merchantId }
+      });
+      
+      return null;
+      
     } catch (error) {
       console.error('❌ Failed to get merchant from cache:', error);
       return null;

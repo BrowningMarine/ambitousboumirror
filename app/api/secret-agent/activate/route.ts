@@ -24,8 +24,19 @@ async function validateInternalRequest(request: NextRequest): Promise<{ valid: b
     const allowedDomains = appConfig.allowedDomains;
     
     const requestDomain = referer ? new URL(referer).host : (origin ? new URL(origin).host : null);
+    const requestHostname = referer ? new URL(referer).hostname : (origin ? new URL(origin).hostname : null);
     
-    if (!requestDomain || !allowedDomains.includes(requestDomain)) {
+    console.log('Active SA Request domain:', requestDomain);
+    console.log('Active SA Request hostname:', requestHostname);
+    console.log('Active SA Allowed domains:', allowedDomains);
+    
+    // Check if domain matches (with or without port)
+    const isDomainAllowed = requestDomain && (
+      allowedDomains.includes(requestDomain) || // Full match (with port)
+      allowedDomains.includes(requestHostname!) // Hostname match (without port)
+    );
+    
+    if (!isDomainAllowed) {
       return { valid: false, error: `Unauthorized domain: ${requestDomain}` };
     }
     
