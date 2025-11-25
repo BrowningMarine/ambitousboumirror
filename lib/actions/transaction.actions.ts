@@ -12,7 +12,6 @@ import { Account, VietQRResponse } from "@/types";
 import { ID } from "appwrite";
 // import { sendWebhookNotification } from "@/utils/webhook"; // Deprecated: Now handled by batched webhook response
 import axios from "axios";
-import { scheduleTransactionExpiry } from "@/lib/redisJobScheduler";
 import { fromLocalDateString, setStartOfDay, setEndOfDay, getStartOfDayUTC, getEndOfDayUTC } from "@/lib/utils";
 import { appConfig } from "../appconfig";
 
@@ -474,27 +473,7 @@ export async function createTransaction(transactionData: Omit<Transaction, '$id'
       `create-transaction-${transactionData.odrId}`
     );
 
-    // Schedule expiry and update statistics in parallel if this is a processing transaction
-    const promises = [];
-
-    // Schedule expiry for processing transactions
-    if (transaction.odrStatus === 'processing' && transaction.odrType === 'deposit') {
-      promises.push(
-        scheduleTransactionExpiry(
-          transaction.$id,
-          transaction.odrId,
-          transaction.$createdAt
-        )
-      );
-    }
-
-    // Wait for all background operations to complete
-    if (promises.length > 0) {
-      // Don't await this - let it run in the background and return the transaction immediately
-      Promise.all(promises).catch(error => {
-        console.error("Error in background operations for transaction creation:", error);
-      });
-    }
+    // Background operations removed - expiry processing uses database scans
 
     return {
       success: true,
@@ -529,28 +508,7 @@ export async function createTransactionOptimized(transactionData: Omit<Transacti
       }
     );
 
-    // Schedule expiry and background tasks in parallel without blocking the response
-    const backgroundTasks: Promise<void>[] = [];
-
-    // Schedule expiry for processing transactions
-    if (transaction.odrStatus === 'processing' && transaction.odrType === 'deposit') {
-      backgroundTasks.push(
-        scheduleTransactionExpiry(
-          transaction.$id,
-          transaction.odrId as string,
-          transaction.$createdAt as string
-        ).catch(error => {
-          console.error("Error scheduling transaction expiry:", error);
-        })
-      );
-    }
-
-    // Run background tasks without waiting (non-blocking)
-    if (backgroundTasks.length > 0) {
-      Promise.all(backgroundTasks).catch(error => {
-        console.error("Error in background operations for transaction creation:", error);
-      });
-    }
+    // Background operations removed - expiry processing uses database scans
 
     console.log(`Transaction ${transaction.$id} created successfully with optimized method`);
     return {
@@ -605,11 +563,22 @@ export async function updateTransactionStatus(
     const readClient = await DatabaseOptimizer.getReadOnlyClient();
 
     // Get the current transaction using read-only client
-    const transaction = await readClient.database.getDocument(
-      DATABASE_ID,
-      ODRTRANS_COLLECTION_ID,
-      transactionId
-    ) as Transaction;
+    let transaction: Transaction;
+    try {
+      transaction = await readClient.database.getDocument(
+        DATABASE_ID,
+        ODRTRANS_COLLECTION_ID,
+        transactionId
+      ) as Transaction;
+    } catch (fetchError) {
+      console.error(`Error fetching transaction ${transactionId}:`, fetchError);
+      // If fetch fails but we can still attempt the update, continue with minimal data
+      // Otherwise re-throw
+      if (fetchError instanceof Error && fetchError.message.includes('documentId')) {
+        throw new Error(`Invalid transaction ID format: ${transactionId.substring(0, 50)}...`);
+      }
+      throw fetchError;
+    }
 
     // If transaction is already in the target status, return early
     if (transaction.odrStatus === newStatus) {
@@ -618,16 +587,6 @@ export async function updateTransactionStatus(
         message: `Transaction already in ${newStatus} status`,
         data: transaction
       };
-    }
-
-    // Check if we're changing to processing from another status
-    if (transaction.odrStatus !== 'processing' && newStatus === 'processing' && transaction.odrType === 'deposit') {
-      // Schedule a new expiry job
-      await scheduleTransactionExpiry(
-        transactionId,
-        transaction.odrId,
-        transaction.$createdAt
-      );
     }
 
     // Update the transaction status using write-optimized client

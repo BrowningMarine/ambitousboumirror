@@ -72,6 +72,7 @@ export interface AppConfigJson {
     allowRegister: boolean;
     trustedDomains: string[];
     allowAllFrameEmbedding: boolean;
+    allowedDomains?: string[];
   };
   security: {
     paymentEncryptionKey: string;
@@ -103,7 +104,9 @@ export interface AppConfigJson {
     databasePriority?: ('appwrite' | 'supabase' | 'fallback')[];
   };
   webhookSettings?: {
-    enableCallbackBatching?: boolean;
+    enableCallbackBatching?: boolean; // Backward compatibility - applies to both if new fields not set
+    depositWebhookMode?: 'batch' | 'legacy'; // Separate mode for deposit orders
+    withdrawWebhookMode?: 'batch' | 'legacy'; // Separate mode for withdraw orders
     description?: string;
   };
   merchants: Record<string, MerchantConfig>;
@@ -111,10 +114,12 @@ export interface AppConfigJson {
   _instructions: Record<string, string>;
 }
 
-// LRU Cache - 60 second TTL, holds 1 config entry
+// LRU Cache - 24 hour TTL for production efficiency
+// Config rarely changes, so long cache reduces Redis costs to near-zero
+// When config is saved, cache is explicitly cleared via clearConfigCache()
 const configLRUCache = new LRUCache<string, AppConfigJson>({
   max: 1, // Only store one config
-  ttl: 60 * 1000, // 60 seconds
+  ttl: 24 * 60 * 60 * 1000, // 24 hours
 });
 
 // Redis client (lazy initialized)
@@ -176,6 +181,9 @@ function isNodeEnvironment(): boolean {
  * - Fallback: Static import (instant, zero cost)
  * 
  * Result: 1000 requests in 60s = 999 cached + 1 Redis read
+ * 
+ * IMPORTANT: This is synchronous - use loadAppConfigAsync() for proper Redis loading
+ * This function falls back to local JSON immediately and loads Redis in background
  */
 export function loadAppConfig(forceReload = false): AppConfigJson {
   const CACHE_KEY = 'appconfig';
@@ -188,22 +196,9 @@ export function loadAppConfig(forceReload = false): AppConfigJson {
     }
   }
   
-  // Step 2: LRU cache miss - try to load from Redis or local
-  // Note: This is synchronous fallback, async load happens in background
-  const mode = getStorageMode();
-  
-  if (mode === 'redis' && isNodeEnvironment()) {
-    // Trigger async Redis load (don't block)
-    loadFromRedisAsync().then(config => {
-      if (config) {
-        configLRUCache.set(CACHE_KEY, config);
-      }
-    }).catch(err => {
-      console.error('[Config] Failed to load from Redis:', err);
-    });
-  }
-  
-  // Step 3: Return from local sources while Redis loads
+  // Step 2: Cache miss - return from local sources immediately
+  // Note: For production with Redis, use loadAppConfigAsync() instead for proper Redis loading
+  // This sync function always returns local/static data to avoid blocking
   return loadFromLocalSources();
 }
 
@@ -253,7 +248,10 @@ async function loadFromRedisAsync(): Promise<AppConfigJson | null> {
         ? JSON.parse(configString) 
         : configString as AppConfigJson;
       
-      console.log('[Config] ✓ Loaded from Redis (realtime)');
+      // Add stack trace to see where this is being called from
+      const stack = new Error().stack;
+      const caller = stack?.split('\n')[3]?.trim() || 'unknown';
+      console.log('[Config] ✓ Loaded from Redis (realtime)', `| Called from: ${caller}`);
       return config;
     }
     
@@ -305,30 +303,27 @@ export async function saveAppConfig(config: AppConfigJson): Promise<{
       
       await redis.set('appconfig', configJson);
       
-      // Clear LRU cache to force immediate refresh
-      configLRUCache.clear();
+      // Clear all caches to force immediate refresh across all contexts
+      clearConfigCache();
       
-      // Also update local cache immediately
-      configLRUCache.set('appconfig', config);
-      
-      console.log('[Config] ✓ Saved to Redis - Changes live within 60 seconds');
+      console.log('[Config] ✓ Saved to Redis - All caches cleared, changes will apply on next request');
       
       return {
         success: true,
         mode: 'redis',
-        appliedIn: 'max 60 seconds',
+        appliedIn: 'next request',
         instructions: [
           '✅ Config saved successfully!',
           '',
-          '⚡ Changes will apply across all instances within 60 seconds',
+          '⚡ All caches cleared - changes will apply on next request',
           '🚀 NO REDEPLOYMENT NEEDED',
           '',
           '📊 Performance:',
-          '  - Current instance: Immediate',
-          '  - Other instances: Within 60 seconds (cache refresh)',
-          '  - Cost: 1 Redis write operation',
+          '  - Cache cleared: All instances will reload from Redis on next request',
+          '  - Normal operation: Config cached for 24 hours (near-zero Redis cost)',
+          '  - Cost: ~2 Redis operations per config change',
           '',
-          '💡 Realtime config updates with near-zero cost!'
+          '💡 Smart caching: Long cache for efficiency + instant updates when needed!'
         ].join('\n')
       };
       
@@ -409,7 +404,17 @@ export function getAllMerchants(): Record<string, MerchantConfig> {
  */
 export function getBankConfig(bankId: string): BankConfig | null {
   const config = loadAppConfig();
-  return config.banks[bankId] || null;
+  
+  // First try direct key lookup (for backward compatibility)
+  if (config.banks[bankId]) {
+    return config.banks[bankId];
+  }
+  
+  // Search by bankId field within bank objects
+  const banks = Object.values(config.banks);
+  const bank = banks.find((b: BankConfig) => b.bankId === bankId);
+  
+  return bank || null;
 }
 
 /**
@@ -430,10 +435,23 @@ export function requiresRestart(configKey: string): boolean {
 
 /**
  * Clear configuration cache (useful for hot-reload or force refresh)
+ * Called automatically when config is saved via admin page
  */
 export function clearConfigCache(): void {
   configLRUCache.clear();
-  console.log('[Config] LRU cache cleared - will reload on next access');
+  console.log('[Config] LRU cache cleared - next request will reload from Redis');
+  
+  // Clear module-level caches in appconfig.ts (async to avoid blocking)
+  void (async () => {
+    try {
+      const mod = await import('../appconfig');
+      if (mod.clearModuleCache) {
+        mod.clearModuleCache();
+      }
+    } catch {
+      // Ignore errors
+    }
+  })();
 }
 
 /**

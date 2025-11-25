@@ -39,7 +39,7 @@ async function loadRuntimeConfig() {
 
   configPromise = (async () => {
     try {
-      const response = await fetch('/api/realtime-config');
+      const response = await fetch('/api/realtime-verify');
       if (!response.ok) throw new Error('Failed to fetch config');
       runtimeConfig = await response.json();
       console.log('🔧 [Realtime] Config loaded:', runtimeConfig?.mode);

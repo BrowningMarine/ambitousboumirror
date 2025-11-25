@@ -1,17 +1,20 @@
 /**
  * API endpoint to provide realtime database credentials to client
  * This allows keeping env vars without NEXT_PUBLIC_ prefix
+ * Uses async config loading to ensure fresh data from blob storage
  */
 
 import { NextResponse } from 'next/server';
-import { getCoreRunningMode } from '@/lib/appconfig';
+import { loadAppConfigAsync } from '@/lib/json/config-loader';
 
 export async function GET() {
   try {
-    const runningMode = getCoreRunningMode();
+    // Use cached config (24-hour cache, near-zero Redis cost)
+    const appConfig = await loadAppConfigAsync();
+    const runningMode = appConfig.databaseSettings?.coreRunningMode || 'auto';
     
     // Only return credentials based on active mode
-    const config: {
+    const responseConfig: {
       mode: 'auto' | 'appwrite' | 'supabase' | 'fallback';
       supabase?: { url: string; anonKey: string };
       appwrite?: { endpoint: string; projectId: string; databaseId: string; ordersCollectionId: string };
@@ -25,7 +28,7 @@ export async function GET() {
       const supabaseAnonKey = process.env.SUPABASE_BK_ANON_KEY;
       
       if (supabaseUrl && supabaseAnonKey) {
-        config.supabase = {
+        responseConfig.supabase = {
           url: supabaseUrl,
           anonKey: supabaseAnonKey
         };
@@ -40,7 +43,7 @@ export async function GET() {
       const appwriteOrdersCollectionId = process.env.NEXT_PUBLIC_APPWRITE_ODRTRANS_COLLECTION_ID; // Fixed: ODRTRANS not ORDERS
       
       if (appwriteEndpoint && appwriteProjectId && appwriteDatabaseId && appwriteOrdersCollectionId) {
-        config.appwrite = {
+        responseConfig.appwrite = {
           endpoint: appwriteEndpoint,
           projectId: appwriteProjectId,
           databaseId: appwriteDatabaseId,
@@ -49,7 +52,7 @@ export async function GET() {
       }
     }
 
-    return NextResponse.json(config);
+    return NextResponse.json(responseConfig);
   } catch (error) {
     console.error('❌ [Realtime Config API] Error:', error);
     return NextResponse.json(

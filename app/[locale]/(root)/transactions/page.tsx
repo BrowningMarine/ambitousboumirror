@@ -727,7 +727,74 @@ export default function TransactionsPageWithAdvancedFilters() {
 
       setProcessingResults(results);
 
-      // Process transactions sequentially with optimized delay
+      // OPTIMIZATION: For notification mode, use bulk webhook endpoint instead of sequential processing
+      if (operationMode === "notification") {
+        try {
+          // Extract all order IDs from the Excel data
+          const orderIds = data
+            .map((row) =>
+              String(row.orderId || row.OrderId || row.order_id || "").trim()
+            )
+            .filter(Boolean); // Remove empty strings
+
+          if (orderIds.length === 0) {
+            results.failed = data.length;
+            results.errors.push({
+              orderId: "ALL",
+              error: "No valid order IDs found in Excel file",
+            });
+            setProcessingResults(results);
+            return results;
+          }
+
+          console.log(`📦 Bulk notification resend: ${orderIds.length} orders`);
+
+          // Use bulk webhook endpoint
+          const response = await fetch("/api/resend-webhook-bulk", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              orderIds,
+              markAsCompleted,
+              markAsFailed,
+              markAsPending,
+            }),
+          });
+
+          const bulkResult = await response.json();
+
+          if (response.ok && bulkResult.success) {
+            results.successful = bulkResult.results.successful;
+            results.failed = bulkResult.results.failed;
+            results.errors = bulkResult.results.errors;
+            console.log(
+              `✅ Bulk notification completed: ${results.successful} success, ${results.failed} failed (${bulkResult.mode} mode)`
+            );
+          } else {
+            results.failed = orderIds.length;
+            results.errors.push({
+              orderId: "BULK_REQUEST",
+              error: bulkResult.message || "Bulk notification request failed",
+            });
+          }
+
+          setProcessingResults(results);
+          return results;
+        } catch (error) {
+          results.failed = data.length;
+          results.errors.push({
+            orderId: "BULK_REQUEST",
+            error:
+              error instanceof Error
+                ? error.message
+                : "Unknown error processing bulk notifications",
+          });
+          setProcessingResults(results);
+          return results;
+        }
+      }
+
+      // For payment mode, process transactions sequentially (original behavior)
       for (let i = 0; i < data.length; i++) {
         const row = data[i];
         const orderId = String(
@@ -774,27 +841,15 @@ export default function TransactionsPageWithAdvancedFilters() {
               continue;
             }
 
-            // Find transaction to get expected amount
-            const transaction = transactions.find((t) => t.odrId === orderId);
-            if (!transaction) {
-              results.failed++;
-              results.errors.push({
-                orderId,
-                paymentId,
-                error: "Order not found in current transactions",
-              });
-              continue;
-            }
-
-            // Process payment
+            // Process payment - API will fetch transaction details from database
+            // No need to check local transactions array (may not contain the order)
             const response = await fetch("/api/validate-payment", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
                 paymentId: paymentId || undefined, // Allow undefined for SecretAgent auto-validation
                 orderId,
-                expectedAmount: transaction.unPaidAmount,
-                transactionType: transaction.odrType,
+                // Don't send expectedAmount or transactionType - let API fetch from database
                 portal,
               }),
             });
@@ -857,7 +912,6 @@ export default function TransactionsPageWithAdvancedFilters() {
     },
     [
       operationMode,
-      transactions,
       selectedBulkPortal,
       markAsFailed,
       markAsCompleted,
@@ -1285,15 +1339,35 @@ export default function TransactionsPageWithAdvancedFilters() {
       const wb = XLSX.utils.book_new();
 
       if (operationMode === "payment") {
-        // Create payment processing template
-        const ws = XLSX.utils.aoa_to_sheet([
-          ["orderId", "paymentId", "portal"],
-          ["ABO20250710WEIJ5RB", "11295493", "cassoflow"],
-          ["ABO20250710X8ALTLB", "11295492", "sepay"],
-          ["ABO20250710XYZSECRET", "", "secretagent"],
-          ["", "", ""], // Empty row for user to fill
-        ]);
-        XLSX.utils.book_append_sheet(wb, ws, "Payment Processing");
+        // Create payment processing template based on default portal
+        if (selectedBulkPortal === "secretagent") {
+          // SecretAgent simplified template (only orderId needed)
+          const ws = XLSX.utils.aoa_to_sheet([
+            ["orderId"],
+            ["ABO20250710XYZSECRET"],
+            ["ABO20250710ANOTHER"],
+            [""], // Empty row for user to fill
+          ]);
+          XLSX.utils.book_append_sheet(wb, ws, "SecretAgent Auto-Validation");
+
+          toast.success(
+            "SecretAgent template downloaded! Only orderId column needed - paymentId will be auto-validated."
+          );
+        } else {
+          // Standard template with all portals
+          const ws = XLSX.utils.aoa_to_sheet([
+            ["orderId", "paymentId", "portal"],
+            ["ABO20250710WEIJ5RB", "11295493", "cassoflow"],
+            ["ABO20250710X8ALTLB", "11295492", "sepay"],
+            ["ABO20250710XYZSECRET", "", "secretagent"],
+            ["", "", ""], // Empty row for user to fill
+          ]);
+          XLSX.utils.book_append_sheet(wb, ws, "Payment Processing");
+
+          toast.success(
+            "Template downloaded! For SecretAgent: leave paymentId empty. For others: fill all columns."
+          );
+        }
       } else {
         // Create notification resend template
         const ws = XLSX.utils.aoa_to_sheet([
@@ -1303,19 +1377,22 @@ export default function TransactionsPageWithAdvancedFilters() {
           [""], // Empty row for user to fill
         ]);
         XLSX.utils.book_append_sheet(wb, ws, "Notification Resend");
+
+        toast.success("Template downloaded successfully!");
       }
 
       const filename =
         operationMode === "payment"
-          ? "payment-processing-template.xlsx"
+          ? selectedBulkPortal === "secretagent"
+            ? "payment-secretagent-template.xlsx"
+            : "payment-processing-template.xlsx"
           : "notification-resend-template.xlsx";
 
       XLSX.writeFile(wb, filename);
-      toast.success("Template downloaded successfully!");
     } catch {
       toast.error("Failed to download template");
     }
-  }, [operationMode]);
+  }, [operationMode, selectedBulkPortal]);
 
   const exportWithdrawalToExcel = useCallback(async () => {
     if (
@@ -2630,19 +2707,28 @@ export default function TransactionsPageWithAdvancedFilters() {
                         <ul className="list-disc list-inside space-y-1">
                           <li>
                             <strong>orderId</strong> - The order ID to process
+                            (Required)
                           </li>
                           <li>
                             <strong>paymentId</strong> - The payment ID from
-                            bank (optional for SecretAgent - supports
-                            auto-validation)
+                            bank (Required for Cassoflow/Sepay,{" "}
+                            <span className="text-green-700 font-semibold">
+                              Optional for SecretAgent
+                            </span>
+                            )
                           </li>
                           <li>
                             <strong>portal</strong> - (Optional)
                             &apos;cassoflow&apos;, &apos;sepay&apos;, or
                             &apos;secretagent&apos;. If not specified, uses
-                            default portal selection below.
+                            default portal below.
                           </li>
                         </ul>
+                        <div className="mt-2 text-xs text-blue-700 italic">
+                          💡 Tip: When using SecretAgent as default portal,
+                          download the simplified template with only orderId
+                          column.
+                        </div>
                       </>
                     ) : (
                       <>
@@ -2692,7 +2778,7 @@ export default function TransactionsPageWithAdvancedFilters() {
                           <SelectItem value="cassoflow">Cassoflow</SelectItem>
                           <SelectItem value="sepay">Sepay</SelectItem>
                           <SelectItem value="secretagent">
-                            SecretAgent
+                            SecretAgent (Auto-validation)
                           </SelectItem>
                         </SelectContent>
                       </Select>
@@ -2700,6 +2786,33 @@ export default function TransactionsPageWithAdvancedFilters() {
                         This will be used for payments that don&apos;t specify a
                         portal in the Excel file.
                       </div>
+
+                      {/* SecretAgent Simplified Instructions */}
+                      {selectedBulkPortal === "secretagent" && (
+                        <div className="mt-3 p-3 bg-green-50 border border-green-200 rounded-lg">
+                          <div className="flex items-start gap-2">
+                            <svg
+                              className="w-5 h-5 text-green-600 mt-0.5 flex-shrink-0"
+                              fill="none"
+                              stroke="currentColor"
+                              viewBox="0 0 24 24"
+                            >
+                              <path
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                strokeWidth={2}
+                                d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"
+                              />
+                            </svg>
+                            <div className="text-sm text-green-800">
+                              <strong>SecretAgent Mode:</strong> Excel file only
+                              needs <strong>orderId</strong> column. PaymentId
+                              will be auto-validated from the bank transaction
+                              history.
+                            </div>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
 
@@ -2855,9 +2968,10 @@ export default function TransactionsPageWithAdvancedFilters() {
                             </Label>
                           </div>
                           <div className="text-xs text-blue-700">
-                            If checked, orders will have their status updated to pending.
-                            This is an admin-only operation for transaction status management.
-                            No notifications will be sent as pending is not a final status.
+                            If checked, orders will have their status updated to
+                            pending. This is an admin-only operation for
+                            transaction status management. No notifications will
+                            be sent as pending is not a final status.
                           </div>
                         </div>
                       )}

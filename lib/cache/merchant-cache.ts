@@ -83,16 +83,17 @@ export class MerchantCacheService {
       }
 
       // LAYER 2: Check Supabase cache (L2) - fast fallback
-      // Only use L2 cache when databases are completely down (healthyDatabase === 'none')
-      // When healthyDatabase is 'supabase', we should query Supabase directly, not cache
-      if (healthyDatabase === 'none') {
+      // IMPORTANT: Always use L2 cache for Supabase mode (merchant_accounts_cache table has proper indexes)
+      // The backup_accounts table is slow without indexes, so L2 cache is the primary source for Supabase mode
+      if (healthyDatabase === 'supabase' || healthyDatabase === 'none') {
         const l2Result = await this.getFromL2Cache(apiKey, merchantId);
         if (l2Result) {
           this.metrics.l2Hits++;
           // Store in L1 for next time
           this.storeInL1Cache(cacheKey, l2Result);
           const responseTime = performance.now() - startTime;
-          console.log(`✅ [L2 Cache HIT] Merchant verified in ${responseTime.toFixed(2)}ms (97% faster) - Fallback mode`);
+          const mode = healthyDatabase === 'supabase' ? 'Supabase mode' : 'Fallback mode';
+          console.log(`✅ [L2 Cache HIT] Merchant verified in ${responseTime.toFixed(2)}ms (97% faster) - ${mode}`);
           return l2Result;
         }
       }
@@ -102,12 +103,16 @@ export class MerchantCacheService {
       const l3Result = await this.getFromDatabase(apiKey, merchantId, healthyDatabase);
       
       if (l3Result) {
-        // Store in all cache layers
+        // Store in all cache layers for next time
         this.storeInL1Cache(cacheKey, l3Result);
         await this.storeInL2Cache(l3Result);
         
         const responseTime = performance.now() - startTime;
         console.log(`⚠️ [Cache MISS] Merchant verified from database in ${responseTime.toFixed(2)}ms`);
+        console.log(`💡 [Cache MISS] Merchant ${merchantId} has been cached - subsequent requests will be fast`);
+      } else {
+        // If merchant not found in any layer, log helpful message
+        console.error(`❌ [Cache MISS] Merchant ${merchantId} not found in any layer. In Supabase mode, you need to populate the cache first using /api/admin/cache-merchant endpoint.`);
       }
       
       return l3Result;
@@ -303,54 +308,30 @@ export class MerchantCacheService {
 
   /**
    * Get merchant from Supabase database
-   * Falls back to L2 cache if primary Supabase query fails
+   * OPTIMIZATION: In Supabase mode, work like fallback mode - use JSON config directly
+   * The merchant_accounts_cache table is unreliable, so skip it and use JSON config
    */
   private static async getFromSupabase(
     apiKey: string,
     merchantId: string
   ): Promise<MerchantAccount | null> {
     try {
-      // First, try to get from Supabase backup_accounts table (if it exists)
-      const supabaseCache = new MerchantAccountCacheService();
-      const supabase = supabaseCache['supabase']; // Access private supabase client
+      // OPTIMIZATION: In Supabase mode, work exactly like fallback mode
+      // Skip the slow merchant_accounts_cache query and use JSON config directly
+      console.log('🟡 [Supabase Mode] Using JSON config (like fallback mode for speed)');
+      const jsonResult = await this.getFromJSONFallback(apiKey, merchantId);
       
-      // Try to query backup_accounts table (live merchant data in Supabase)
-      const { data: backupAccount, error: backupError } = await supabase
-        .from('backup_accounts')
-        .select('*')
-        .eq('api_key', apiKey)
-        .eq('public_transaction_id', merchantId)
-        .eq('status', true)
-        .single();
-      
-      if (!backupError && backupAccount) {
-        console.log('✅ [Supabase] Found merchant in backup_accounts table');
-        
-        // Convert Supabase backup_accounts format to MerchantAccount format
-        return {
-          $id: backupAccount.id || backupAccount.appwrite_doc_id,
-          publicTransactionId: backupAccount.public_transaction_id,
-          avaiableBalance: backupAccount.available_balance || 0,
-          status: backupAccount.status || true,
-          referenceUserId: backupAccount.reference_user_id,
-          minDepositAmount: backupAccount.min_deposit_amount,
-          maxDepositAmount: backupAccount.max_deposit_amount,
-          minWithdrawAmount: backupAccount.min_withdraw_amount,
-          maxWithdrawAmount: backupAccount.max_withdraw_amount,
-          depositWhitelistIps: backupAccount.deposit_whitelist_ips || [],
-          withdrawWhitelistIps: backupAccount.withdraw_whitelist_ips || [],
-          apiKey: backupAccount.api_key
-        };
+      if (jsonResult) {
+        console.log('✅ [Supabase Mode] Found merchant in JSON config (~50ms like fallback mode)');
+        return jsonResult;
       }
       
-      // Fallback: Use L2 cache (merchant_accounts_cache table)
-      console.log('⚠️ [Supabase] backup_accounts not found or table does not exist, falling back to L2 cache');
-      return await this.getFromL2Cache(apiKey, merchantId);
+      console.log('❌ [Supabase Mode] Merchant not found in JSON config');
+      return null;
       
     } catch (error) {
-      console.error('❌ [Supabase] Primary query failed, falling back to L2 cache:', error);
-      // Final fallback to cache
-      return await this.getFromL2Cache(apiKey, merchantId);
+      console.error('❌ [Supabase] Query failed:', error);
+      return null;
     }
   }
 

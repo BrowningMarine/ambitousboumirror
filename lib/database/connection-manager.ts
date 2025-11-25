@@ -9,6 +9,8 @@ export class DatabaseConnectionManager {
     failures: number;
     lastFailure: number;
     state: 'closed' | 'open' | 'half-open';
+    consecutiveFailures: number;
+    lastSuccessTime: number;
   };
   private cleanupInterval: NodeJS.Timeout | null = null;
 
@@ -17,10 +19,13 @@ export class DatabaseConnectionManager {
     this.operationQueue = new Map();
 
     // Circuit breaker for database health
+    // IMPROVEMENT: More lenient thresholds for bulk webhook processing
     this.circuitBreaker = {
       failures: 0,
       lastFailure: 0,
-      state: 'closed'
+      state: 'closed',
+      consecutiveFailures: 0, // Track consecutive failures without success
+      lastSuccessTime: Date.now(),
     };
 
     // Start automatic cleanup of stale operations
@@ -64,31 +69,46 @@ export class DatabaseConnectionManager {
     this.operationQueue.clear();
   }
 
-  // Circuit breaker logic
+  // Circuit breaker logic - IMPROVED for bulk webhook processing
   private isCircuitOpen(): boolean {
     const now = Date.now();
     
-    // Reset circuit after 60 seconds
-    if (this.circuitBreaker.state === 'open' && now - this.circuitBreaker.lastFailure > 60000) {
+    // IMPROVEMENT: Auto-recover if we had recent successes
+    const timeSinceLastSuccess = now - this.circuitBreaker.lastSuccessTime;
+    if (this.circuitBreaker.state === 'open' && timeSinceLastSuccess < 30000) {
+      // If we had a success within last 30 seconds, be forgiving
+      this.circuitBreaker.state = 'half-open';
+      this.circuitBreaker.consecutiveFailures = 0;
+    }
+    
+    // Reset circuit after 2 minutes (increased from 60s)
+    if (this.circuitBreaker.state === 'open' && now - this.circuitBreaker.lastFailure > 120000) {
       this.circuitBreaker.state = 'half-open';
       this.circuitBreaker.failures = 0;
+      this.circuitBreaker.consecutiveFailures = 0;
     }
 
     return this.circuitBreaker.state === 'open';
   }
 
   private recordSuccess(): void {
-    this.circuitBreaker.failures = 0;
+    this.circuitBreaker.failures = Math.max(0, this.circuitBreaker.failures - 1); // Gradually reduce failure count
+    this.circuitBreaker.consecutiveFailures = 0;
+    this.circuitBreaker.lastSuccessTime = Date.now();
     this.circuitBreaker.state = 'closed';
   }
 
   private recordFailure(): void {
     this.circuitBreaker.failures++;
+    this.circuitBreaker.consecutiveFailures++;
     this.circuitBreaker.lastFailure = Date.now();
     
-    // Open circuit after 5 failures
-    if (this.circuitBreaker.failures >= 5) {
+    // IMPROVEMENT: Much more lenient threshold for bulk operations
+    // Only open circuit after many consecutive failures (20 instead of 5)
+    // This prevents circuit opening during bulk webhook processing (22 transactions)
+    if (this.circuitBreaker.consecutiveFailures >= 20) {
       this.circuitBreaker.state = 'open';
+      console.error(`[DB Manager] Circuit breaker opened after ${this.circuitBreaker.consecutiveFailures} consecutive failures`);
     }
   }
 
@@ -114,21 +134,28 @@ export class DatabaseConnectionManager {
       } catch (error) {
         lastError = error as Error;
         
-        // Check if it's a 520 or connection error
+        // IMPROVEMENT: Enhanced error detection with rate limit awareness
+        const errorMessage = error instanceof Error ? error.message : String(error);
         const isRetryableError = 
           error instanceof Error && (
             error.message.includes('520') ||
+            error.message.includes('429') || // Rate limit
             error.message.includes('timeout') ||
             error.message.includes('connection') ||
             error.message.includes('network') ||
             error.message.includes('500') ||
             error.message.includes('502') ||
-            error.message.includes('503')
+            error.message.includes('503') ||
+            error.message.includes('ECONNRESET') ||
+            error.message.includes('ETIMEDOUT')
           );
 
         if (!isRetryableError || attempt === maxRetries) {
-          // Don't record failure for fallback operations - they're expected to fail
+          // Enhanced error logging for diagnosis
           if (!operationName.endsWith('-fallback')) {
+            if (attempt === maxRetries) {
+              console.error(`[DB Manager] Operation ${operationName} failed after ${maxRetries} retries. Error: ${errorMessage}`);
+            }
             this.recordFailure();
           }
           throw error;

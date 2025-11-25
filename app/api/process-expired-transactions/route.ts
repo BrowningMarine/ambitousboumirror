@@ -1,5 +1,4 @@
 import { NextResponse } from 'next/server';
-import { getAllScheduledJobs } from '@/lib/redisJobScheduler';
 import { processAllExpiredTransactions } from '@/lib/actions/transaction.actions';
 import { headers } from 'next/headers';
 
@@ -47,7 +46,8 @@ export async function POST() {
   }
 }
 
-// GET endpoint for monitoring
+// GET endpoint for monitoring - DEPRECATED: Redis job scheduling removed
+// Transaction expiry now uses database scans exclusively
 export async function GET() {
   try {
     const headersList = await headers();
@@ -66,39 +66,18 @@ export async function GET() {
       );
     }
 
-    const allJobs = await getAllScheduledJobs();
-    const now = Date.now();
-
-    const jobsWithStatus = allJobs.map(job => {
-      const timeRemaining = job.scheduledFor - now;
-      const isExpired = timeRemaining <= 0;
-
-      return {
-        transactionId: job.transactionId,
-        odrId: job.odrId,
-        createdAt: job.createdAt,
-        scheduledFor: new Date(job.scheduledFor).toISOString(),
-        timeRemaining: Math.max(0, timeRemaining),
-        isExpired,
-        status: isExpired ? 'expired' : 'waiting',
-        overdue: isExpired ? Math.abs(timeRemaining) : 0
-      };
-    });
-
-    const expiredJobs = jobsWithStatus.filter(job => job.isExpired);
-    const waitingJobs = jobsWithStatus.filter(job => !job.isExpired);
-
+    // Redis job monitoring has been removed
+    // Use database queries to check processing transactions instead
     return NextResponse.json({
       success: true,
-      totalJobs: allJobs.length,
-      expiredCount: expiredJobs.length,
-      waitingCount: waitingJobs.length,
-      allJobs: jobsWithStatus,
-      expiredJobs,
-      waitingJobs
+      message: 'Redis job monitoring has been removed. Transaction expiry uses database scans exclusively.',
+      totalJobs: 0,
+      expiredCount: 0,
+      waitingCount: 0,
+      note: 'Query the database directly for processing transactions to monitor payment windows'
     });
   } catch (error) {
-    console.error('❌ Error getting scheduled jobs:', error);
+    console.error('❌ Error in monitoring endpoint:', error);
     return NextResponse.json(
       {
         success: false,

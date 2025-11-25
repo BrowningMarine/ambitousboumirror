@@ -166,34 +166,45 @@ export default function ConfigAdminPage() {
 
     try {
       setDecryptionError("");
-      
+
       // Convert URL-safe base64 back to standard base64
       const base64 = encryptedUrl
-        .replace(/-/g, '+')
-        .replace(/_/g, '/')
-        .padEnd(encryptedUrl.length + (4 - (encryptedUrl.length % 4)) % 4, '=');
-      
+        .replace(/-/g, "+")
+        .replace(/_/g, "/")
+        .padEnd(
+          encryptedUrl.length + ((4 - (encryptedUrl.length % 4)) % 4),
+          "="
+        );
+
       // Decode from base64
       const combined = atob(base64);
-      
+
       // Split IV, authTag, and encrypted data (format: iv:authTag:encrypted)
       const parts = combined.split(":");
       if (parts.length !== 3) {
-        throw new Error("Invalid encrypted URL format. Expected format: iv:authTag:encryptedData (base64 encoded)");
+        throw new Error(
+          "Invalid encrypted URL format. Expected format: iv:authTag:encryptedData (base64 encoded)"
+        );
       }
 
       const [ivHex, authTagHex, encryptedHex] = parts;
-      
+
       // Convert hex strings to Uint8Array
-      const iv = new Uint8Array(ivHex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
-      const authTag = new Uint8Array(authTagHex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
-      const encryptedData = new Uint8Array(encryptedHex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
-      
+      const iv = new Uint8Array(
+        ivHex.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16))
+      );
+      const authTag = new Uint8Array(
+        authTagHex.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16))
+      );
+      const encryptedData = new Uint8Array(
+        encryptedHex.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16))
+      );
+
       // Derive key from encryption key (32 bytes for AES-256)
       const keyMaterial = new TextEncoder().encode(
-        config.security.paymentEncryptionKey.padEnd(32, '0').substring(0, 32)
+        config.security.paymentEncryptionKey.padEnd(32, "0").substring(0, 32)
       );
-      
+
       // Import the key for AES-GCM
       const cryptoKey = await crypto.subtle.importKey(
         "raw",
@@ -202,29 +213,29 @@ export default function ConfigAdminPage() {
         false,
         ["decrypt"]
       );
-      
+
       // Decrypt using AES-GCM
       const decryptedBuffer = await crypto.subtle.decrypt(
-        { 
-          name: "AES-GCM", 
+        {
+          name: "AES-GCM",
           iv,
-          tagLength: 128 // 16 bytes
+          tagLength: 128, // 16 bytes
         },
         cryptoKey,
         new Uint8Array([...encryptedData, ...authTag]) // Append auth tag to encrypted data
       );
-      
+
       // Convert to string and parse JSON
       const decrypted = new TextDecoder().decode(decryptedBuffer);
       const paymentData = JSON.parse(decrypted);
-      
+
       // Format as readable JSON
       setDecryptedUrl(JSON.stringify(paymentData, null, 2));
       setDecryptionError("");
     } catch (err) {
       setDecryptionError(
-        err instanceof Error 
-          ? `Decryption failed: ${err.message}` 
+        err instanceof Error
+          ? `Decryption failed: ${err.message}`
           : "Failed to decrypt URL. Check encryption key and format."
       );
       setDecryptedUrl("");
@@ -614,7 +625,7 @@ export default function ConfigAdminPage() {
         {/* Configuration Tabs */}
         {config && (
           <Tabs defaultValue="base" className="w-full">
-            <TabsList className="grid w-full grid-cols-3 sm:grid-cols-3 md:grid-cols-6 h-auto p-1 bg-gray-100 gap-1">
+            <TabsList className="grid w-full grid-cols-3 sm:grid-cols-4 md:grid-cols-7 h-auto p-1 bg-gray-100 gap-1">
               <TabsTrigger
                 value="base"
                 className="data-[state=active]:bg-white data-[state=active]:border-b-2 data-[state=active]:border-blue-500 data-[state=active]:text-blue-600 font-medium text-xs sm:text-sm px-2 py-2"
@@ -628,6 +639,13 @@ export default function ConfigAdminPage() {
               >
                 <span className="hidden sm:inline">Database</span>
                 <span className="sm:hidden">DB</span>
+              </TabsTrigger>
+              <TabsTrigger
+                value="webhook"
+                className="data-[state=active]:bg-white data-[state=active]:border-b-2 data-[state=active]:border-purple-500 data-[state=active]:text-purple-600 font-medium text-xs sm:text-sm px-2 py-2"
+              >
+                <span className="hidden sm:inline">Webhooks</span>
+                <span className="sm:hidden">WH</span>
               </TabsTrigger>
               <TabsTrigger
                 value="advanced"
@@ -717,136 +735,6 @@ export default function ConfigAdminPage() {
                         )
                       }
                     />
-                  </div>
-
-                  {/* Webhook Settings Section */}
-                  <div className="border-t pt-4 sm:pt-6 mt-4 sm:mt-6">
-                    <h3 className="text-base sm:text-lg font-semibold mb-3 sm:mb-4 flex flex-wrap items-center gap-2">
-                      Webhook Configuration
-                      <Badge variant="default" className="bg-green-600 text-xs">
-                        <CheckCircle2 className="w-3 h-3 mr-1" />
-                        Live Reload
-                      </Badge>
-                    </h3>
-                    
-                    <Alert className="bg-green-50 border-green-200 mb-4">
-                      <CheckCircle2 className="h-4 w-4 text-green-600" />
-                      <AlertDescription className="text-green-800 text-xs sm:text-sm">
-                        ✅ Webhook settings load dynamically - changes take effect immediately!
-                      </AlertDescription>
-                    </Alert>
-
-                    {/* Enable Callback Batching */}
-                    <div className="space-y-4">
-                      <div className="flex items-start space-x-3">
-                        <input
-                          type="checkbox"
-                          id="enableCallbackBatching"
-                          checked={Boolean(
-                            config.webhookSettings?.enableCallbackBatching ?? true
-                          )}
-                          onChange={(e) => {
-                            const newConfig = { ...config };
-                            if (!newConfig.webhookSettings) {
-                              newConfig.webhookSettings = {};
-                            }
-                            newConfig.webhookSettings.enableCallbackBatching = e
-                              .target.checked as never;
-                            setConfig(newConfig);
-                            setJsonView(JSON.stringify(newConfig, null, 2));
-                            setHasChanges(true);
-                          }}
-                          className="w-5 h-5 mt-0.5"
-                        />
-                        <div className="flex-1">
-                          <label
-                            htmlFor="enableCallbackBatching"
-                            className="text-sm font-medium cursor-pointer"
-                          >
-                            Enable Webhook Callback Batching
-                          </label>
-                          <p className="text-xs text-gray-600 mt-1">
-                            When enabled, multiple orders with the same callback
-                            URL are batched into a single array request.
-                          </p>
-                        </div>
-                      </div>
-
-                      {/* Explanation Cards */}
-                      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-4">
-                        {/* Batching Enabled */}
-                        <div
-                          className={`p-3 sm:p-4 rounded-lg border-2 ${
-                            config.webhookSettings?.enableCallbackBatching ?? true
-                              ? "bg-teal-50 border-teal-300"
-                              : "bg-gray-50 border-gray-200"
-                          }`}
-                        >
-                          <h4 className="font-semibold text-xs sm:text-sm mb-2 flex items-center gap-2">
-                            <CheckCircle2
-                              className={`w-3 h-3 sm:w-4 sm:h-4 ${
-                                config.webhookSettings?.enableCallbackBatching ??
-                                true
-                                  ? "text-teal-600"
-                                  : "text-gray-400"
-                              }`}
-                            />
-                            Batching Mode (Recommended)
-                          </h4>
-                          <div className="text-xs space-y-1 sm:space-y-2 text-gray-700">
-                            <p>
-                              <strong>How it works:</strong> Groups orders by callback URL
-                            </p>
-                            <p>
-                              <strong>Format:</strong> ALWAYS array (even single items)
-                            </p>
-                            <p>
-                              <strong>Example:</strong> 1 order → array[1], 10 orders → array[10]
-                            </p>
-                            <p className="text-teal-700">
-                              ✅ <strong>Benefits:</strong> 90%+ reduction in HTTP requests
-                            </p>
-                          </div>
-                        </div>
-
-                        {/* Batching Disabled */}
-                        <div
-                          className={`p-3 sm:p-4 rounded-lg border-2 ${
-                            !(
-                              config.webhookSettings?.enableCallbackBatching ??
-                              true
-                            )
-                              ? "bg-orange-50 border-orange-300"
-                              : "bg-gray-50 border-gray-200"
-                          }`}
-                        >
-                          <h4 className="font-semibold text-xs sm:text-sm mb-2 flex items-center gap-2">
-                            <AlertTriangle
-                              className={`w-3 h-3 sm:w-4 sm:h-4 ${
-                                !(
-                                  config.webhookSettings
-                                    ?.enableCallbackBatching ?? true
-                                )
-                                  ? "text-orange-600"
-                                  : "text-gray-400"
-                              }`}
-                            />
-                            Parallel Mode (Legacy)
-                          </h4>
-                          <div className="text-xs space-y-1 sm:space-y-2 text-gray-700">
-                            <p>
-                              <strong>How it works:</strong> Sends each order separately
-                            </p>
-                            <p>
-                              <strong>Example:</strong> 10 orders → 10 separate requests
-                            </p>
-                            <p className="text-orange-700">
-                              ⚠️ <strong>Note:</strong> More network overhead
-                            </p>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
                   </div>
                 </CardContent>
               </Card>
@@ -1171,6 +1059,168 @@ export default function ConfigAdminPage() {
                 </CardContent>
               </Card>
             </TabsContent>
+            {/* Webhook Settings */}
+            <TabsContent value="webhook">
+              <Card>
+                <CardHeader>
+                  <CardTitle>Webhook Configuration</CardTitle>
+                  <CardDescription>
+                    Configure webhook notification modes for deposit and
+                    withdraw orders separately
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-6">
+                  <Alert>
+                    <Server className="h-4 w-4" />
+                    <AlertDescription>
+                      <strong>Webhook Modes:</strong>
+                      <ul className="list-disc list-inside mt-2 space-y-1 text-sm">
+                        <li>
+                          <strong>Batch Mode:</strong> Groups orders by callback
+                          URL, sends as array in single request (efficient for
+                          multiple orders)
+                        </li>
+                        <li>
+                          <strong>Legacy Mode:</strong> Sends each order
+                          separately in parallel requests (for merchants
+                          expecting single-order format)
+                        </li>
+                      </ul>
+                    </AlertDescription>
+                  </Alert>
+
+                  <div className="space-y-4 border-l-4 border-green-500 pl-4 py-2">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <label className="text-sm font-medium">
+                          Deposit Orders Webhook Mode
+                        </label>
+                        <p className="text-xs text-gray-500">
+                          How to send webhook notifications for deposit
+                          transactions
+                        </p>
+                      </div>
+                      <select
+                        value={
+                          config.webhookSettings?.depositWebhookMode ||
+                          (config.webhookSettings?.enableCallbackBatching ??
+                          true
+                            ? "batch"
+                            : "legacy")
+                        }
+                        onChange={(e) => {
+                          setConfig({
+                            ...config,
+                            webhookSettings: {
+                              ...config.webhookSettings,
+                              depositWebhookMode: e.target.value as
+                                | "batch"
+                                | "legacy",
+                            },
+                          });
+                          setHasChanges(true);
+                        }}
+                        className="border rounded px-3 py-2 text-sm"
+                      >
+                        <option value="batch">Batch Mode (Array)</option>
+                        <option value="legacy">Legacy Mode (Single)</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="space-y-4 border-l-4 border-red-500 pl-4 py-2">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <label className="text-sm font-medium">
+                          Withdraw Orders Webhook Mode
+                        </label>
+                        <p className="text-xs text-gray-500">
+                          How to send webhook notifications for withdrawal
+                          transactions
+                        </p>
+                      </div>
+                      <select
+                        value={
+                          config.webhookSettings?.withdrawWebhookMode ||
+                          (config.webhookSettings?.enableCallbackBatching ??
+                          true
+                            ? "batch"
+                            : "legacy")
+                        }
+                        onChange={(e) => {
+                          setConfig({
+                            ...config,
+                            webhookSettings: {
+                              ...config.webhookSettings,
+                              withdrawWebhookMode: e.target.value as
+                                | "batch"
+                                | "legacy",
+                            },
+                          });
+                          setHasChanges(true);
+                        }}
+                        className="border rounded px-3 py-2 text-sm"
+                      >
+                        <option value="batch">Batch Mode (Array)</option>
+                        <option value="legacy">Legacy Mode (Single)</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                    <h4 className="font-medium text-sm mb-2">
+                      Example Webhook Payloads:
+                    </h4>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                      <div>
+                        <strong className="text-green-600">
+                          Batch Mode (Array):
+                        </strong>
+                        <pre className="mt-1 p-2 bg-white rounded border overflow-auto">
+                          {`[
+  {
+    "odrId": "ORD001",
+    "orderType": "deposit",
+    "odrStatus": "completed",
+    "amount": 100000
+  },
+  {
+    "odrId": "ORD002",
+    "orderType": "deposit",
+    "odrStatus": "completed",
+    "amount": 200000
+  }
+]`}
+                        </pre>
+                      </div>
+                      <div>
+                        <strong className="text-orange-600">
+                          Legacy Mode (Single):
+                        </strong>
+                        <pre className="mt-1 p-2 bg-white rounded border overflow-auto">
+                          {`{
+  "odrId": "ORD001",
+  "orderType": "deposit",
+  "odrStatus": "completed",
+  "amount": 100000
+}`}
+                        </pre>
+                      </div>
+                    </div>
+                  </div>
+
+                  <Alert className="bg-yellow-50 border-yellow-200">
+                    <AlertTriangle className="h-4 w-4 text-yellow-600" />
+                    <AlertDescription>
+                      <strong>Note:</strong> Changes take effect immediately for
+                      new webhook notifications. The system will use the
+                      appropriate mode based on each order&apos;s type
+                      (deposit/withdraw).
+                    </AlertDescription>
+                  </Alert>
+                </CardContent>
+              </Card>
+            </TabsContent>
             {/* Advanced & QR Settings */}
             <TabsContent value="advanced">
               <Card>
@@ -1296,13 +1346,19 @@ export default function ConfigAdminPage() {
 
                   {/* QR Service Section */}
                   <div className="border-t pt-4 sm:pt-6 mt-4 sm:mt-6">
-                    <h3 className="text-base sm:text-lg font-semibold mb-3 sm:mb-4">QR Service Configuration</h3>
-                    
+                    <h3 className="text-base sm:text-lg font-semibold mb-3 sm:mb-4">
+                      QR Service Configuration
+                    </h3>
+
                     <div className="space-y-4">
                       <div>
-                        <label className="text-sm font-medium">Create QR By</label>
+                        <label className="text-sm font-medium">
+                          Create QR By
+                        </label>
                         <select
-                          value={String(config.baseSettings.createQrBy || "vietqr")}
+                          value={String(
+                            config.baseSettings.createQrBy || "vietqr"
+                          )}
                           onChange={(e) => {
                             setConfig({
                               ...config,
@@ -1324,18 +1380,26 @@ export default function ConfigAdminPage() {
                       </div>
 
                       <div>
-                        <label className="text-sm font-medium">VietQR Client URL</label>
+                        <label className="text-sm font-medium">
+                          VietQR Client URL
+                        </label>
                         <Input
                           value={String(config.qrService.clientUrl || "")}
                           onChange={(e) =>
-                            updateField("qrService", "clientUrl", e.target.value)
+                            updateField(
+                              "qrService",
+                              "clientUrl",
+                              e.target.value
+                            )
                           }
                           placeholder="https://api.vietqr.io"
                         />
                       </div>
 
                       <div>
-                        <label className="text-sm font-medium">VietQR Client ID</label>
+                        <label className="text-sm font-medium">
+                          VietQR Client ID
+                        </label>
                         <Input
                           value={String(config.qrService.clientId || "")}
                           onChange={(e) =>
@@ -1346,7 +1410,9 @@ export default function ConfigAdminPage() {
                       </div>
 
                       <div>
-                        <label className="text-sm font-medium">VietQR Client Secret</label>
+                        <label className="text-sm font-medium">
+                          VietQR Client Secret
+                        </label>
                         <div className="relative">
                           <Input
                             type={showQrClientSecret ? "text" : "password"}
@@ -1516,14 +1582,21 @@ export default function ConfigAdminPage() {
                   <div className="border-t pt-4 sm:pt-6 mt-4 sm:mt-6">
                     <h3 className="text-base sm:text-lg font-semibold mb-3 sm:mb-4 flex items-center gap-2">
                       <Lock className="w-4 h-4 sm:w-5 sm:h-5 text-blue-600" />
-                      <span className="hidden sm:inline">Payment URL Decryption Tool</span>
+                      <span className="hidden sm:inline">
+                        Payment URL Decryption Tool
+                      </span>
                       <span className="sm:hidden">URL Decryption</span>
                     </h3>
-                    
+
                     <Alert className="mb-4 bg-blue-50 border-blue-200">
                       <AlertTriangle className="h-4 w-4 text-blue-600" />
                       <AlertDescription className="text-blue-800">
-                        <strong>Decrypt Payment URLs:</strong> Use this tool to decrypt encrypted payment URLs using the Payment Encryption Key above. The encrypted URL format is: <code className="bg-blue-100 px-1 rounded">iv:encryptedData</code>
+                        <strong>Decrypt Payment URLs:</strong> Use this tool to
+                        decrypt encrypted payment URLs using the Payment
+                        Encryption Key above. The encrypted URL format is:{" "}
+                        <code className="bg-blue-100 px-1 rounded">
+                          iv:encryptedData
+                        </code>
                       </AlertDescription>
                     </Alert>
 
@@ -1540,14 +1613,18 @@ export default function ConfigAdminPage() {
                           rows={3}
                         />
                         <p className="text-xs text-gray-500 mt-1">
-                          Enter the encrypted URL string (format: iv:encryptedData in hex)
+                          Enter the encrypted URL string (format:
+                          iv:encryptedData in hex)
                         </p>
                       </div>
 
                       <Button
                         type="button"
                         onClick={decryptPaymentUrl}
-                        disabled={!encryptedUrl.trim() || !config?.security?.paymentEncryptionKey}
+                        disabled={
+                          !encryptedUrl.trim() ||
+                          !config?.security?.paymentEncryptionKey
+                        }
                         className="bg-blue-600 hover:bg-blue-700 text-white w-full sm:w-auto"
                       >
                         <Lock className="w-4 h-4 mr-2" />
@@ -1557,7 +1634,9 @@ export default function ConfigAdminPage() {
                       {decryptionError && (
                         <Alert variant="destructive">
                           <AlertTriangle className="h-4 w-4" />
-                          <AlertDescription className="text-xs sm:text-sm">{decryptionError}</AlertDescription>
+                          <AlertDescription className="text-xs sm:text-sm">
+                            {decryptionError}
+                          </AlertDescription>
                         </Alert>
                       )}
 
@@ -1592,13 +1671,17 @@ export default function ConfigAdminPage() {
                       <Alert className="bg-gray-50">
                         <AlertTriangle className="h-4 w-4" />
                         <AlertDescription>
-                          <strong>Decryption Algorithm:</strong> AES-256-GCM (Galois/Counter Mode)
+                          <strong>Decryption Algorithm:</strong> AES-256-GCM
+                          (Galois/Counter Mode)
                           <br />
-                          <strong>Key Format:</strong> 32-byte key (padded if shorter)
+                          <strong>Key Format:</strong> 32-byte key (padded if
+                          shorter)
                           <br />
-                          <strong>Input Format:</strong> Base64-encoded string containing iv:authTag:encryptedData (hex format)
+                          <strong>Input Format:</strong> Base64-encoded string
+                          containing iv:authTag:encryptedData (hex format)
                           <br />
-                          <strong>Usage:</strong> Paste the full encrypted URL path segment to decrypt and view payment data
+                          <strong>Usage:</strong> Paste the full encrypted URL
+                          path segment to decrypt and view payment data
                         </AlertDescription>
                       </Alert>
                     </div>
@@ -1610,7 +1693,9 @@ export default function ConfigAdminPage() {
             <TabsContent value="fallback">
               <Card>
                 <CardHeader>
-                  <CardTitle>Merchants & Banks Fallback Configuration</CardTitle>
+                  <CardTitle>
+                    Merchants & Banks Fallback Configuration
+                  </CardTitle>
                   <CardDescription>
                     Fallback data when databases are unavailable
                     <Badge variant="default" className="ml-2">
@@ -1683,7 +1768,9 @@ export default function ConfigAdminPage() {
                             onClick={handleGenerateHash}
                             className="bg-blue-600 hover:bg-blue-700 text-white shrink-0 w-full sm:w-auto"
                           >
-                            <span className="hidden sm:inline">Generate Hash</span>
+                            <span className="hidden sm:inline">
+                              Generate Hash
+                            </span>
                             <span className="sm:hidden">Generate</span>
                           </Button>
                         </div>
@@ -1758,14 +1845,17 @@ export default function ConfigAdminPage() {
 
                   {/* Banks Section */}
                   <div className="border-t pt-6 mt-6">
-                    <h3 className="text-lg font-semibold mb-4">Bank Fallback Configuration</h3>
-                    
+                    <h3 className="text-lg font-semibold mb-4">
+                      Bank Fallback Configuration
+                    </h3>
+
                     <Alert className="mb-4">
                       <AlertTriangle className="h-4 w-4" />
                       <AlertDescription>
                         <strong>Advanced Users Only:</strong> This is raw JSON
-                        configuration. Banks are usually managed in your database.
-                        This fallback is used when the database is unavailable.
+                        configuration. Banks are usually managed in your
+                        database. This fallback is used when the database is
+                        unavailable.
                         <br />
                         <br />
                         <strong>How to edit:</strong> Edit the JSON directly in
@@ -1773,7 +1863,7 @@ export default function ConfigAdminPage() {
                         code, account number, owner name, amounts, and status.
                       </AlertDescription>
                     </Alert>
-                    
+
                     <div className="space-y-4">
                       <div className="text-sm text-gray-600">
                         {Object.keys(config.banks).length} banks configured

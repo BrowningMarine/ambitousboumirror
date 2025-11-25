@@ -25,8 +25,8 @@ import { BackupOrderService, BankTransactionEntryService } from '@/lib/supabase-
 
 // OPTIMIZATION: Enhanced caching with larger capacity for high performance
 const bankLookupCache = new LRUCache<string, Awaited<ReturnType<typeof findBankByAccountNumber>>>({
-  max: 2000, // Increased cache size for better hit rate
-  ttl: 600000, // 10 minutes TTL for frequently used banks
+  max: 5000, // High capacity for high-volume webhooks (10k/day ≈ 5k unique banks)
+  ttl: 1800000, // 30 minutes TTL - banks rarely change during business day
 });
 
 // OPTIMIZATION: Larger duplicate cache with shorter TTL for safety
@@ -265,7 +265,14 @@ export async function fastTrackTransaction(portal: string, transactionId: string
 // OPTIMIZATION: Adaptive concurrency based on portal performance and system load
 function getOptimalConcurrency(portal: string, transactionCount: number): number {
   const metrics = portalMetrics.get(portal);
-  let baseConcurrency = 12; // Default
+  
+  // IMPROVEMENT: Allow environment variable override for self-hosted Appwrite
+  // Set MAX_WEBHOOK_CONCURRENCY=5 for resource-limited servers
+  const maxConcurrencyOverride = process.env.MAX_WEBHOOK_CONCURRENCY 
+    ? parseInt(process.env.MAX_WEBHOOK_CONCURRENCY) 
+    : null;
+  
+  let baseConcurrency = maxConcurrencyOverride || 12; // Default 12, or env override
   
   // Adjust based on batch size - larger batches need more careful concurrency
   if (transactionCount > 100) {
@@ -1240,28 +1247,41 @@ async function processUniversalTransaction(
         if (cachedWebhookData.urlCallback) {
           try {
             const { sendWebhookNotification } = await import('@/utils/webhook');
+            const { isWebhookCallbackBatchingEnabled } = await import('@/lib/appconfig');
             
+            // Prepare webhook data
             const callbackPayload = {
               odrId: odrId,
               merchantOrdId: cachedWebhookData.merchantOrdId || '',
+              orderType: cachedWebhookData.orderType,
               odrStatus: 'completed',
-              odrType: cachedWebhookData.orderType,
-              amount: Math.abs(normalizedTx.amount),
-              paidAmount: Math.abs(normalizedTx.amount),
-              bankAccountNumber: normalizedTx.accountNumber,
-              bankAccountName: cachedWebhookData.bankReceiveOwnerName || cachedWebhookData.accountName || '',
-              transactionId: portalTransactionId,
-              transactionNote: normalizedTx.description,
-              completedAt: new Date().toISOString()
+              bankReceiveNumber: normalizedTx.accountNumber,
+              bankReceiveOwnerName: cachedWebhookData.bankReceiveOwnerName || cachedWebhookData.accountName || '',
+              amount: Math.abs(normalizedTx.amount)
             };
             
-            await sendWebhookNotification(
-              cachedWebhookData.urlCallback,
-              callbackPayload,
-              cachedWebhookData.apiKey,
-              true,
-              'webhook-fallback-mode'
-            );
+            // Check webhook batching config to determine format
+            const batchingEnabled = isWebhookCallbackBatchingEnabled();
+            
+            if (batchingEnabled) {
+              // BATCHING MODE: Send as array (even for single item)
+              await sendWebhookNotification(
+                cachedWebhookData.urlCallback,
+                [callbackPayload] as unknown as Record<string, unknown>,
+                cachedWebhookData.apiKey,
+                true,
+                'webhook-fallback-batch'
+              );
+            } else {
+              // PARALLEL MODE: Send as single object (legacy behavior)
+              await sendWebhookNotification(
+                cachedWebhookData.urlCallback,
+                callbackPayload,
+                cachedWebhookData.apiKey,
+                true,
+                'webhook-fallback-single'
+              );
+            }
             
             // Mark callback as sent
             await markCallbackSent(odrId);
@@ -1692,6 +1712,7 @@ async function processUniversalTransaction(
     let bankReceiveOwnerName: string | undefined;
     let paidAmount: number | undefined;
     let apiKey: string | undefined;
+    let orderDocumentId: string | undefined; // The actual order document ID for notification status updates
 
     // Fetch order details based on running mode (for webhook callbacks)
     if (odrId) {
@@ -1703,6 +1724,7 @@ async function processUniversalTransaction(
             const transaction = await getTransactionByOrderId(odrId);
             
             if (transaction) {
+              orderDocumentId = transaction.$id; // ✅ Capture the order document ID
               urlCallback = transaction.urlCallBack || undefined;
               merchantOrdId = transaction.merchantOrdId || undefined;
               orderType = transaction.odrType;
@@ -1734,6 +1756,8 @@ async function processUniversalTransaction(
               const order = await backupOrderService.getBackupOrder(odrId);
               
               if (order) {
+                // Use Supabase ID if it has synced appwrite_doc_id, otherwise use its own id
+                orderDocumentId = order.appwrite_doc_id || order.id;
                 urlCallback = order.url_callback || undefined;
                 merchantOrdId = order.merchant_odr_id || undefined;
                 orderType = order.odr_type;
@@ -1774,6 +1798,8 @@ async function processUniversalTransaction(
           const order = await backupOrderService.getBackupOrder(odrId);
           
           if (order) {
+            // Use Supabase ID if it has synced appwrite_doc_id, otherwise use its own id
+            orderDocumentId = order.appwrite_doc_id || order.id;
             urlCallback = order.url_callback || undefined;
             merchantOrdId = order.merchant_odr_id || undefined;
             orderType = order.odr_type;
@@ -1822,16 +1848,26 @@ async function processUniversalTransaction(
       bankReceiveOwnerName,
       paidAmount,
       apiKey, // For bulk webhook authentication
+      transactionId: orderDocumentId, // ✅ FIXED: Use order document ID (not bank entry ID) for notification status updates
       message: `Transaction ${finalStatus === 'processed' ? 'processed successfully' : 
                 finalStatus === 'available' ? 'recorded as available for redemption' : 'failed'}`,
       metrics: processingMetrics
     };
 
   } catch (error) {
-    // Log individual transaction errors silently to console for debugging
-    const rawTransaction = transaction as CassoflowTransaction | SepayTransaction;
+    // Log individual transaction errors with full details for debugging
+    const rawTransaction = transaction as CassoflowTransaction | SepayTransaction | SecretAgentTransaction;
     const errorId = rawTransaction?.id || 'unknown';
-    console.error('Transaction processing error:', errorId, error);
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const errorStack = error instanceof Error ? error.stack : undefined;
+    
+    console.error(`❌ [${portal}] Transaction ${errorId} processing error:`, {
+      transactionId: errorId,
+      portal,
+      error: errorMessage,
+      stack: errorStack,
+      transaction: rawTransaction
+    });
 
     // IMPORTANT: On error, try to save rawPayload for debugging
     try {
@@ -1847,7 +1883,7 @@ async function processUniversalTransaction(
         transactionDate: new Date().toISOString(),
         rawPayload: JSON.stringify(transaction), // Store full payload on error
         status: 'failed',
-        notes: `Error: ${error instanceof Error ? error.message : String(error)}`
+        notes: `Error: ${errorMessage}`
       };
       await createBankTransactionEntry(errorEntryData);
     } catch (saveError) {
@@ -1859,7 +1895,9 @@ async function processUniversalTransaction(
     return {
       id: errorId,
       status: 'failed',
-      message: `Error processing transaction: ${error instanceof Error ? error.message : String(error)}`,
+      message: `Error processing transaction: ${errorMessage}`,
+      error: errorMessage, // ✅ NEW: Include error in response for logging
+      errorStack: errorStack?.split('\n').slice(0, 3).join('\n'), // ✅ NEW: First 3 lines of stack
       metrics: processingMetrics
     };
   }
@@ -1870,8 +1908,10 @@ export async function POST(
   request: NextRequest,
   context: Props
 ) {
-  // OPTIMIZATION: Comprehensive performance monitoring with detailed phase tracking
+  // CRITICAL: Start timing IMMEDIATELY to capture full request duration including network I/O
   const requestStartTime = performance.now();
+  
+  // OPTIMIZATION: Comprehensive performance monitoring with detailed phase tracking
   const performanceMetrics = {
     // Phase 1: Setup + Validation + Authentication (combined small operations)
     setupAndValidation: 0,
@@ -1883,23 +1923,38 @@ export async function POST(
     transactionProcessing: 0,
     
     // Phase 4: Total request time
-    total: 0
+    total: 0,
+    
+    // Network I/O breakdown (captures the missing ~5.5 seconds)
+    paramsTime: 0,
+    payloadReadTime: 0
   };
 
   try {
-    // Start timing for setup + validation combined
-    const setupValidationStart = performance.now();
+    // OPTIMIZATION: Read headers synchronously first (no await needed)
+    const cassoSignature = request.headers.get('X-Casso-Signature');
+    const sepayAuthorization = request.headers.get('authorization');
     
-    const params = await context.params;
+    // OPTIMIZATION: Parallel I/O operations - read params and payload simultaneously
+    const paramsStart = performance.now();
+    const [params, payload] = await Promise.all([
+      context.params,
+      request.text()
+    ]);
+    const ioTime = performance.now() - paramsStart;
+    
     const portal = params.portal.toLowerCase();
     
-    // Fast-path: Check environment variables first (cached in memory)
+    // Fast-path: Environment variables are cached in memory (synchronous access)
     const CASSOFLOW_API_KEY = process.env.CASSOFLOW_API_KEY;
     const SEPAY_API_KEY = process.env.SEPAY_API_KEY;
     const SECRETAGENT_WEBHOOK_API_KEY = process.env.SECRETAGENT_WEBHOOK_API_KEY;
     
-    // Read payload once
-    const payload = await request.text();
+    // Store timing breakdown (I/O is now parallelized, measuring combined time)
+    performanceMetrics.paramsTime = ioTime; // Combined parallel I/O time
+    performanceMetrics.payloadReadTime = 0; // Not measured separately due to parallel execution
+    performanceMetrics.setupAndValidation = ioTime;
+    performanceMetrics.payloadParsing = 0; // Will be set later during JSON parsing
 
     // CRITICAL: Never return errors for valid webhook structure - banking systems resend failures
     // Only log issues for debugging, but always process the transaction data
@@ -1914,7 +1969,7 @@ export async function POST(
           validationIssues.push('Missing CASSOFLOW_API_KEY environment variable');
         }
         
-        const cassoSignature = request.headers.get('X-Casso-Signature');
+        // Use pre-fetched header from top
         if (!cassoSignature) {
           validationIssues.push('Missing X-Casso-Signature header');
         }
@@ -1923,20 +1978,8 @@ export async function POST(
           validationIssues.push('Empty or missing payload');
         }
 
-        // If critical validation failed, log and return success to prevent resend
+        // If critical validation failed, return success immediately (no logging overhead)
         if (validationIssues.length > 0) {
-          performanceMetrics.setupAndValidation = performance.now() - setupValidationStart;
-          performanceMetrics.total = performance.now() - requestStartTime;
-          
-          await log.performance(`Webhook ${portal} validation failed`, performanceMetrics.total, {
-            portal,
-            phases: {
-              setupAndValidation: Math.round(performanceMetrics.setupAndValidation),
-              totalTime: Math.round(performanceMetrics.total)
-            },
-            result: 'validation_failed'
-          });
-          
           return NextResponse.json({
             success: true, // CRITICAL: Always return success to prevent resend
             message: `Webhook received but has validation issues: ${validationIssues.join(', ')}`,
@@ -1951,7 +1994,7 @@ export async function POST(
         try {
           payloadParsed = JSON.parse(payload) as CassoflowPayload;
         } catch (parseError) {
-          performanceMetrics.setupAndValidation = parsingStart - setupValidationStart;
+          // setupAndValidation already set to ioTime
           performanceMetrics.payloadParsing = performance.now() - parsingStart;
           performanceMetrics.total = performance.now() - requestStartTime;
           
@@ -1973,8 +2016,7 @@ export async function POST(
           });
         }
         
-        // Complete setup+validation phase timing
-        performanceMetrics.setupAndValidation = parsingStart - setupValidationStart;
+        // Complete payload parsing phase timing
         performanceMetrics.payloadParsing = performance.now() - parsingStart;
 
         // Verify signature but don't fail - log for debugging
@@ -2085,7 +2127,7 @@ export async function POST(
           sepayValidationIssues.push('Missing SEPAY_API_KEY environment variable');
         }
         
-        const sepayAuthorization = request.headers.get('authorization');
+        // Use pre-fetched header from top
         if (!sepayAuthorization) {
           sepayValidationIssues.push('Missing authorization header');
         } else {
@@ -2117,8 +2159,7 @@ export async function POST(
           });
         }
 
-        // Complete setup+validation timing, start parsing
-        performanceMetrics.setupAndValidation = performance.now() - setupValidationStart;
+        // Start parsing timing
         const sepayParsingStart = performance.now();
         
         // Parse the payload with error handling
@@ -2233,8 +2274,7 @@ export async function POST(
           });
         }
 
-        // Complete setup+validation timing, start parsing
-        performanceMetrics.setupAndValidation = performance.now() - setupValidationStart;
+        // Start parsing timing
         const secretAgentParsingStart = performance.now();
         
         // Parse the payload with error handling
